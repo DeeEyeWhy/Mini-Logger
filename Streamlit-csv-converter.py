@@ -96,4 +96,4 @@ if uploaded_file:
     st.pyplot(fig)
 
 else:
-    st.info("Please upload a CSV file to get started.")
+    st.info("Upload a CSV file to get started.")
