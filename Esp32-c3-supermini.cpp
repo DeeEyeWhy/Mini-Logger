@@ -31,24 +31,51 @@ unsigned long lastGpsByteTime = 0;
 // RPM value (update this variable in your own code logic)
 int RPM = 0;
 
-// ===== SD card presence check function =====
+// Your 16x16 SD card icon bitmap
+const unsigned char sdIcon16x16[] PROGMEM = {
+  0xFF, 0xFF,
+  0x80, 0x01,
+  0xBF, 0xFD,
+  0xBF, 0xFD,
+  0xBF, 0xFD,
+  0xBF, 0xFD,
+  0xBF, 0xFD,
+  0x80, 0x01,
+  0x8F, 0xF1,
+  0x88, 0x11,
+  0x88, 0x11,
+  0x88, 0x11,
+  0x88, 0x11,
+  0x88, 0x11,
+  0x88, 0x11,
+  0xFF, 0xFF
+};
+
+// Cache SD insertion status and update every 2 seconds
+bool sdInsertedCached = false;
+unsigned long lastSdCheckTime = 0;
+
 bool isSDInserted() {
-  SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
-  bool ok = SD.begin(SD_CS, SPI);
-  SD.end();
-  return ok;
+  if (millis() - lastSdCheckTime > 2000) { // check every 2 seconds
+    sdInsertedCached = SD.begin(SD_CS, SPI);
+    lastSdCheckTime = millis();
+  }
+  return sdInsertedCached;
 }
+
+// Global variable to track logging state
+bool isLogging = false;
+
+// Blink control variables
+unsigned long lastBlinkTime = 0;
+bool blinkState = false;
 
 // ===== CSV Logging Function =====
 void logToCSV() {
+  isLogging = false; // reset at start
+
   if (!isSDInserted() || !gps.location.isValid() || !gps.speed.isValid() || !gps.time.isValid()) {
     return; // Don't log if conditions aren't met
-  }
-
-  SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS, SPI)) {
-    SPI.end();
-    return;
   }
 
   File file = SD.open("/log.csv", FILE_APPEND);
@@ -63,9 +90,8 @@ void logToCSV() {
       RPM
     );
     file.close();
+    isLogging = true; // successfully logged!
   }
-
-  SD.end();
 }
 
 void setup() {
@@ -81,7 +107,18 @@ void setup() {
   display.println("Initializing...");
   display.display();
 
+  // Initialize GPS serial
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  // Initialize SPI and SD card once here
+  SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
+  if (SD.begin(SD_CS, SPI)) {
+    Serial.println("SD card initialized.");
+    sdInsertedCached = true;
+  } else {
+    Serial.println("SD card failed to initialize.");
+    sdInsertedCached = false;
+  }
 }
 
 void loop() {
@@ -90,9 +127,13 @@ void loop() {
     lastGpsByteTime = millis();
   }
 
-  // Update RPM here, e.g., RPM = readRPM();
-
   logToCSV();
+
+  // Blink toggle every 500 ms
+  if (millis() - lastBlinkTime > 500) {
+    blinkState = !blinkState;
+    lastBlinkTime = millis();
+  }
 
   display.clearDisplay();
   display.setCursor(0, 0);
@@ -128,8 +169,15 @@ void loop() {
   display.setTextSize(1);
 
   if (isSDInserted()) {
-    display.setCursor(110, 0);
-    display.print("SD");
+    // Draw SD icon blinking / inverted if inserted but NOT logging
+    if (!isLogging && blinkState) {
+      // Invert colors: draw white background then black bitmap
+      display.fillRect(112, 0, 16, 16, SH110X_WHITE);
+      display.drawBitmap(112, 0, sdIcon16x16, 16, 16, SH110X_BLACK);
+    } else {
+      // Normal icon (white on black)
+      display.drawBitmap(112, 0, sdIcon16x16, 16, 16, SH110X_WHITE);
+    }
   }
 
   display.display();
