@@ -8,9 +8,9 @@ from streamlit_folium import st_folium
 import datetime
 from geopy.distance import geodesic
 
-st.title("GPS CSV Viewer with Map, Plot, and Stats")
+st.title("Mini Logger V4.1 CSV Map Converter")
 
-uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"])
+uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
 
 def create_map(df):
     norm = mcolors.Normalize(vmin=df['Speed'].min(), vmax=df['Speed'].max())
