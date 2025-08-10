@@ -51,15 +51,36 @@ const unsigned char sdIcon16x16[] PROGMEM = {
   0xFF, 0xFF
 };
 
-// Cache SD insertion status and update every 2 seconds
+// ===== SD card status cache =====
 bool sdInsertedCached = false;
 unsigned long lastSdCheckTime = 0;
 
+/**
+ * SD card insertion/removal detection
+ * 
+ * Logic:
+ * - If inserted → check every loop until removed
+ * - If removed → check every 2 seconds for reinsertion
+ */
 bool isSDInserted() {
-  if (millis() - lastSdCheckTime > 2000) { // check every 2 seconds
-    sdInsertedCached = SD.begin(SD_CS, SPI);
-    lastSdCheckTime = millis();
+  unsigned long now = millis();
+
+  // If we think it's inserted, check every loop until it's confirmed gone
+  if (sdInsertedCached) {
+    if (!SD.begin(SD_CS, SPI) || SD.cardType() == CARD_NONE) {
+      sdInsertedCached = false;  // Instant removal detection
+    }
+    return sdInsertedCached;
   }
+
+  // If we think it's removed, only try detection every 2 seconds
+  if (now - lastSdCheckTime > 2000) {
+    lastSdCheckTime = now;
+    if (SD.begin(SD_CS, SPI) && SD.cardType() != CARD_NONE) {
+      sdInsertedCached = true; // Found card
+    }
+  }
+
   return sdInsertedCached;
 }
 
@@ -70,12 +91,14 @@ bool isLogging = false;
 unsigned long lastBlinkTime = 0;
 bool blinkState = false;
 
-// ===== CSV Logging Function =====
+/**
+ * Append GPS and RPM data to CSV on SD card
+ */
 void logToCSV() {
   isLogging = false; // reset at start
 
   if (!isSDInserted() || !gps.location.isValid() || !gps.speed.isValid() || !gps.time.isValid()) {
-    return; // Don't log if conditions aren't met
+    return; // Don't log if SD missing or GPS data invalid
   }
 
   File file = SD.open("/log.csv", FILE_APPEND);
@@ -97,6 +120,7 @@ void logToCSV() {
 void setup() {
   Serial.begin(115200);
 
+  // OLED init
   Wire.begin(SDA_PIN, SCL_PIN);
   display.begin(0x3C, true);
   display.setRotation(0);
@@ -107,37 +131,41 @@ void setup() {
   display.println("Initializing...");
   display.display();
 
-  // Initialize GPS serial
+  // GPS serial init
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
 
-  // Initialize SPI and SD card once here
+  // SPI & SD init
   SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
-  if (SD.begin(SD_CS, SPI)) {
+  if (SD.begin(SD_CS, SPI) && SD.cardType() != CARD_NONE) {
     Serial.println("SD card initialized.");
     sdInsertedCached = true;
   } else {
-    Serial.println("SD card failed to initialize.");
+    Serial.println("No SD card found.");
     sdInsertedCached = false;
   }
 }
 
 void loop() {
+  // ===== GPS reading =====
   while (gpsSerial.available()) {
     gps.encode(gpsSerial.read());
-    lastGpsByteTime = millis();
+    lastGpsByteTime = millis(); // mark last GPS activity
   }
 
+  // ===== Data logging =====
   logToCSV();
 
-  // Blink toggle every 500 ms
+  // ===== Blink state update =====
   if (millis() - lastBlinkTime > 500) {
     blinkState = !blinkState;
     lastBlinkTime = millis();
   }
 
+  // ===== OLED display update =====
   display.clearDisplay();
   display.setCursor(0, 0);
 
+  // Time display
   if (gps.time.isValid()) {
     display.printf("%02d:%02d:%02d UTC\n",
       gps.time.hour(),
@@ -147,18 +175,21 @@ void loop() {
     display.println("--:--:--");
   }
 
+  // GPS connection status
   bool gpsConnected = (millis() - lastGpsByteTime < 3000);
   bool hasFix = gps.location.isValid() && gps.location.age() < 3000;
 
   display.printf("GPS Conn: %s\n", gpsConnected ? "YES" : "NO");
   display.printf("Fix: %s\n", hasFix ? "YES" : "NO");
 
+  // Satellite count
   if (gps.satellites.isValid()) {
     display.printf("Sats: %d\n", gps.satellites.value());
   } else {
     display.println("Sats: --");
   }
 
+  // Speed display
   display.setTextSize(3);
   if (gps.speed.isValid()) {
     int speedWhole = (int)(gps.speed.mph() + 0.5);
@@ -168,14 +199,13 @@ void loop() {
   }
   display.setTextSize(1);
 
+  // SD icon display
   if (isSDInserted()) {
-    // Draw SD icon blinking / inverted if inserted but NOT logging
+    // If not logging → blink/invert the icon
     if (!isLogging && blinkState) {
-      // Invert colors: draw white background then black bitmap
-      display.fillRect(112, 0, 16, 16, SH110X_WHITE);
+      display.fillRect(112, 0, 16, 16, SH110X_WHITE); // white box background
       display.drawBitmap(112, 0, sdIcon16x16, 16, 16, SH110X_BLACK);
     } else {
-      // Normal icon (white on black)
       display.drawBitmap(112, 0, sdIcon16x16, 16, 16, SH110X_WHITE);
     }
   }
