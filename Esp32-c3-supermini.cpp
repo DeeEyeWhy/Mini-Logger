@@ -155,6 +155,9 @@ String currentLogFileName = "";
 TinyGPSDate lastDate;
 TinyGPSTime lastTime;
 
+// Track last GPS second logged to sync logging at 1 Hz
+int lastLoggedSecond = -1;
+
 /**
  * Flush the RAM log buffer to the SD card
  */
@@ -232,48 +235,10 @@ void logToCSV() {
   isLogging = true; // Indicate logging activity
 }
 
-void setup() {
-  Serial.begin(115200);
-
-  Wire.begin(SDA_PIN, SCL_PIN);
-  display.begin(0x3C, true);
-  display.setRotation(0);
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SH110X_WHITE);
-  display.setCursor(0, 0);
-  display.println("Initializing...");
-  display.display();
-
-  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
-
-  SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
-  if (SD.begin(SD_CS)) {
-    Serial.println("SD card initialized.");
-    sdInserted = true;
-  } else {
-    Serial.println("No SD card found.");
-    sdInserted = false;
-  }
-
-  // Initialize last buffer flush time
-  lastBufferFlushTime = millis();
-}
-
-void loop() {
-  while (gpsSerial.available()) {
-    gps.encode(gpsSerial.read());
-    lastGpsByteTime = millis();
-  }
-
-  logToCSV();
-
-  // Flush buffer every 5 seconds if there is data
-  if (millis() - lastBufferFlushTime > bufferFlushInterval) {
-    flushLogBuffer();
-    lastBufferFlushTime = millis();
-  }
-
+/**
+ * Update the display content (separated for clarity)
+ */
+void updateDisplay() {
   // Handle blinking dot timing (500 ms)
   if (millis() - lastBlinkTime > 500) {
     blinkState = !blinkState;
@@ -321,4 +286,57 @@ void loop() {
   }
 
   display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  display.begin(0x3C, true);
+  display.setRotation(0);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+  display.setCursor(0, 0);
+  display.println("Initializing...");
+  display.display();
+
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
+  if (SD.begin(SD_CS)) {
+    Serial.println("SD card initialized.");
+    sdInserted = true;
+  } else {
+    Serial.println("No SD card found.");
+    sdInserted = false;
+  }
+
+  // Initialize last buffer flush time
+  lastBufferFlushTime = millis();
+}
+
+void loop() {
+  // Read all available GPS data
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+    lastGpsByteTime = millis();
+  }
+
+  // Log once per GPS second (sync to GPS UTC time)
+  if (gps.time.isValid()) {
+    int currentSecond = gps.time.second();
+    if (currentSecond != lastLoggedSecond) {
+      lastLoggedSecond = currentSecond;
+      logToCSV();
+    }
+  }
+
+  // Flush buffer every 5 seconds if data exists
+  if (millis() - lastBufferFlushTime > bufferFlushInterval) {
+    flushLogBuffer();
+    lastBufferFlushTime = millis();
+  }
+
+  updateDisplay();
 }
