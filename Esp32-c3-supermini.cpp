@@ -5,33 +5,34 @@
 #include <SPI.h>
 #include <SD.h>
 
-// ===== Pinout =====
-// OLED pins
+// ==================== CONFIG ====================
+// Pins
 #define SDA_PIN 20
 #define SCL_PIN 21
-// GPS pins
-#define GPS_RX  3  // GPS TX → ESP32 RX
-#define GPS_TX  4  // GPS RX ← ESP32 TX
-// MicroSD pins (3.3V logic)
+#define GPS_RX  3    // GPS TX -> ESP32 RX
+#define GPS_TX  4    // GPS RX <- ESP32 TX
 #define SD_CS   9
 #define SD_MOSI 8
 #define SD_CLK  7
 #define SD_MISO 6
 
-// ===== Display Setup =====
-Adafruit_SH1107 display(128, 128, &Wire);
+// Make these easy to change:
+#define FLUSH_INTERVAL_SECONDS 5  // buffer flush interval
+#define LOG_INTERVAL_SECONDS 1    // log frequency in seconds
+#define LOG_LINE_SIZE 64          // fixed bytes reserved per line
+#define LOG_LINES_MAX (FLUSH_INTERVAL_SECONDS / LOG_INTERVAL_SECONDS) // computed
 
-// ===== GPS Setup =====
+// Derived
+const unsigned long BUFFER_FLUSH_INTERVAL_MS = (unsigned long)FLUSH_INTERVAL_SECONDS * 1000UL;
+
+// ==================== HARDWARE OBJECTS ====================
+Adafruit_SH1107 display(128, 128, &Wire);
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(1);
+File logFile;
 
-// Track last GPS data time to determine if GPS is connected
-unsigned long lastGpsByteTime = 0;
-
-// RPM value (update this variable in your own code logic)
-int RPM = 0;
-
-// Your 16x16 SD card icon bitmap
+// ==================== ICONS ====================
+// 16x16 SD icon (user provided)
 const unsigned char sdIcon16x16[] PROGMEM = {
   0xFF, 0xFF,
   0x80, 0x01,
@@ -51,7 +52,7 @@ const unsigned char sdIcon16x16[] PROGMEM = {
   0xFF, 0xFF
 };
 
-// 16x16 flashing dot bitmap (a solid filled circle)
+// 16x16 filled dot for logging indicator
 const unsigned char dot16x16[] PROGMEM = {
   0x00,0x00,
   0x07,0xE0,
@@ -71,175 +72,175 @@ const unsigned char dot16x16[] PROGMEM = {
   0x00,0x00
 };
 
-// SD card presence flag (checked once at boot)
-bool sdInserted = false;
-
-// Track if logging occurred in this loop iteration or buffer has data
-bool isLogging = false;
-
-// Blink control for logging dot
+// ==================== STATE ====================
+bool sdInserted = false;           // checked once at boot
+bool isLogging = false;            // true when buffer contains data waiting to flush
 unsigned long lastBlinkTime = 0;
 bool blinkState = false;
+int lastLoggedSecond = -1;
 
-// Timezone offset from UTC
-const int timezoneOffsetHours = -5;  // e.g. CDT
-const int timezoneOffsetMinutes = 0; // partial hour if needed
+char logBuffer[LOG_LINE_SIZE * LOG_LINES_MAX]; // contiguous buffer
+size_t logLinesCount = 0;
 
-// --- SD logging buffer ---
-const size_t LOG_BUFFER_SIZE = 512;   // Buffer size in bytes
-char logBuffer[LOG_BUFFER_SIZE];
-size_t logBufferIndex = 0;
-unsigned long lastBufferFlushTime = 0;
-const unsigned long bufferFlushInterval = 5000; // Flush every 5 seconds
+String currentLogFileName = "";
+TinyGPSDate lastDate;
+TinyGPSTime lastTime;
+unsigned long lastBufferFlushMillis = 0;
 
-struct LocalTime {
-  int hour;
-  int minute;
-  int second;
-};
+// timezone conversion (display only)
+const int timezoneOffsetHours = -5;
+const int timezoneOffsetMinutes = 0;
 
-LocalTime getLocalTime(const TinyGPSDate &date, TinyGPSTime time) {
+// RPM placeholder (your code should update this)
+int RPM = 0;
+
+// ==================== UTIL: local time conversion & formatting ====================
+struct LocalTime { int hour; int minute; int second; };
+
+LocalTime getLocalTime(TinyGPSDate date, TinyGPSTime time) {
   int h = time.hour() + timezoneOffsetHours;
   int m = time.minute() + timezoneOffsetMinutes;
   int s = time.second();
-
   if (s >= 60) { s -= 60; m += 1; }
   if (s < 0)   { s += 60; m -= 1; }
   if (m >= 60) { m -= 60; h += 1; }
   if (m < 0)   { m += 60; h -= 1; }
   if (h >= 24) h -= 24;
   if (h < 0)   h += 24;
-
   return LocalTime{h, m, s};
 }
 
-/**
- * Format hour to 12-hour format and return am/pm string
- */
 void format12Hour(int hour24, int &hour12, const char* &amPm) {
-  if (hour24 == 0) {
-    hour12 = 12;
-    amPm = "AM";
-  } else if (hour24 < 12) {
-    hour12 = hour24;
-    amPm = "AM";
-  } else if (hour24 == 12) {
-    hour12 = 12;
-    amPm = "PM";
-  } else {
-    hour12 = hour24 - 12;
-    amPm = "PM";
+  if (hour24 == 0) { hour12 = 12; amPm = "AM"; }
+  else if (hour24 < 12) { hour12 = hour24; amPm = "AM"; }
+  else if (hour24 == 12) { hour12 = 12; amPm = "PM"; }
+  else { hour12 = hour24 - 12; amPm = "PM"; }
+}
+
+// ==================== RANDOM 4 LETTER CODE GENERATOR ====================
+String randomFourLetterCode() {
+  String code = "";
+  for (int i = 0; i < 4; i++) {
+    char letter = 'A' + random(0, 26); // Random letter A-Z
+    code += letter;
   }
+  return code;
 }
 
-/**
- * Generate log file name from date and local time (12h AM/PM)
- */
-String generateLogFileName(TinyGPSDate &date, TinyGPSTime time) {
-  LocalTime lt = getLocalTime(date, time);
-  int hour12;
-  const char* amPm;
-  format12Hour(lt.hour, hour12, amPm);
+// ==================== FILENAME HANDLING WITH RANDOM CODE ====================
+// returns e.g. "/2025_08_11_ABCD.csv"
+String generateLogFileNameWithRandomCode(TinyGPSDate date) {
+  char base[32];
+  snprintf(base, sizeof(base), "/%04d_%02d_%02d_", date.year(), date.month(), date.day());
 
-  char buf[40];
-  snprintf(buf, sizeof(buf), "/%04d%02d%02d_%02d_%02d_%02d%s_log.csv",
-    date.year(), date.month(), date.day(),
-    hour12, lt.minute, lt.second,
-    amPm
-  );
-  return String(buf);
+  // try up to 100 random codes to find unused filename
+  for (int i = 0; i < 100; ++i) {
+    String code = randomFourLetterCode();
+    char filename[48];
+    snprintf(filename, sizeof(filename), "%s%s.csv", base, code.c_str());
+
+    if (!SD.exists(filename)) {
+      return String(filename);
+    }
+  }
+
+  // fallback filename if all attempts fail
+  snprintf(base, sizeof(base), "/%04d_%02d_%02d_default.csv", date.year(), date.month(), date.day());
+  return String(base);
 }
 
-// Current log file name & last date/time used for log file naming
-String currentLogFileName = "";
-TinyGPSDate lastDate;
-TinyGPSTime lastTime;
+// ==================== WRITE BLANK LINES TO FILE ====================
+void writeBlankLines(File &file, int count = 10) {
+  for (int i = 0; i < count; i++) {
+    // Format: lat,lon,speed_mph,UTC_date,UTC_time,RPM - zeros
+    file.println("0.000000,0.000000,0,0000-00-00 00:00:00,0");
+  }
+  file.flush();
+}
 
-// Track last GPS second logged to sync logging at 1 Hz
-int lastLoggedSecond = -1;
+// ==================== OPEN FILE FOR WRITING AND CREATE HEADER ====================
+bool openLogFileIfNeeded() {
+  if (!sdInserted) return false;
+  if (logFile) return true; // already open
+  if (currentLogFileName == "") {
+    currentLogFileName = generateLogFileNameWithRandomCode(gps.date);
+  }
+  logFile = SD.open(currentLogFileName.c_str(), FILE_WRITE);
+  if (!logFile) {
+    Serial.println("ERROR: could not open log file for writing");
+    return false;
+  }
+  // if new file (size 0) write header
+  if (logFile.size() == 0) {
+    logFile.println("lat,lon,speed_mph,UTC_date,UTC_time,RPM");
+    logFile.flush();
+    writeBlankLines(logFile, 10);
+  }
+  return true;
+}
 
-/**
- * Flush the RAM log buffer to the SD card
- */
+// ==================== FLUSH BUFFER TO SD (keeps file open, uses flush()) ====================
 void flushLogBuffer() {
-  if (logBufferIndex == 0) return; // Nothing to flush
+  if (logLinesCount == 0) return;
 
-  // Check if date/time changed for filename update
-  bool dateChanged = (gps.date.year() != lastDate.year()) ||
-                     (gps.date.month() != lastDate.month()) ||
-                     (gps.date.day() != lastDate.day());
-
-  bool timeChanged = (gps.time.hour() != lastTime.hour()) ||
-                     (gps.time.minute() != lastTime.minute()) ||
-                     (gps.time.second() != lastTime.second());
-
-  if (dateChanged || timeChanged || currentLogFileName == "") {
-    currentLogFileName = generateLogFileName(gps.date, gps.time);
-    lastDate = gps.date;
-    lastTime = gps.time;
-    Serial.print("Flushing buffer to new file: ");
-    Serial.println(currentLogFileName);
+  if (!openLogFileIfNeeded()) {
+    Serial.println("Flush aborted: file not available");
+    return;
   }
 
-  File file = SD.open(currentLogFileName.c_str(), FILE_APPEND);
-  if (file) {
-    file.write((const uint8_t*)logBuffer, logBufferIndex);
-    file.close();
-    Serial.print("Flushed ");
-    Serial.print(logBufferIndex);
-    Serial.println(" bytes to SD");
-    logBufferIndex = 0;  // Reset buffer index
-    isLogging = false;   // Clear logging flag as buffer is empty
-  } else {
-    Serial.println("Failed to open log file for writing");
+  size_t bytesToWrite = logLinesCount * LOG_LINE_SIZE;
+  size_t wrote = logFile.write((const uint8_t*)logBuffer, bytesToWrite);
+  if (wrote != bytesToWrite) {
+    Serial.print("Warning: wrote "); Serial.print(wrote); Serial.print(" of "); Serial.println(bytesToWrite);
   }
+  logFile.flush();
+  Serial.print("Flushed "); Serial.print(bytesToWrite); Serial.println(" bytes to SD (flush)");
+  logLinesCount = 0;
+  isLogging = false;
+  lastDate = gps.date;
+  lastTime = gps.time;
 }
 
-/**
- * Buffer GPS and RPM data to RAM buffer
- */
-void logToCSV() {
-  if (!sdInserted || !gps.location.isValid() || !gps.speed.isValid() || !gps.time.isValid() || !gps.date.isValid()) {
-    return;
-  }
-
-  // Prepare log line in a temporary buffer
-  char line[128];
-  int len = snprintf(line, sizeof(line), "%.6f,%.6f,%d,%04d-%02d-%02d %02d:%02d:%02d,%d\n",
-      gps.location.lat(),
-      gps.location.lng(),
-      (int)(gps.speed.mph() + 0.5),
-      gps.date.year(),
-      gps.date.month(),
-      gps.date.day(),
-      gps.time.hour(),
-      gps.time.minute(),
-      gps.time.second(),
-      RPM
+// ==================== BUFFER A SINGLE LOG LINE (fixed width) ====================
+void bufferLogLine() {
+  char line[LOG_LINE_SIZE];
+  int speed_mph = (int)(gps.speed.mph() + 0.5);
+  int len = snprintf(line, sizeof(line),
+    "%.6f,%.6f,%d,%04d-%02d-%02d %02d:%02d:%02d,%d\n",
+    gps.location.lat(),
+    gps.location.lng(),
+    speed_mph,
+    gps.date.year(),
+    gps.date.month(),
+    gps.date.day(),
+    gps.time.hour(),
+    gps.time.minute(),
+    gps.time.second(),
+    RPM
   );
 
-  if (len < 0 || len >= (int)sizeof(line)) {
-    Serial.println("Error formatting log line");
+  if (len < 0) {
+    Serial.println("Formatting error");
     return;
   }
+  if ((size_t)len > LOG_LINE_SIZE) {
+    len = LOG_LINE_SIZE;
+    line[LOG_LINE_SIZE - 1] = '\n';
+  }
 
-  // If adding this line would overflow buffer, flush first
-  if (logBufferIndex + len >= LOG_BUFFER_SIZE) {
+  for (int i = len; i < (int)LOG_LINE_SIZE; ++i) line[i] = ' ';
+
+  if (logLinesCount >= LOG_LINES_MAX) {
     flushLogBuffer();
   }
 
-  // Copy line into buffer
-  memcpy(&logBuffer[logBufferIndex], line, len);
-  logBufferIndex += len;
-
-  isLogging = true; // Indicate logging activity
+  memcpy(&logBuffer[logLinesCount * LOG_LINE_SIZE], line, LOG_LINE_SIZE);
+  logLinesCount++;
+  isLogging = true;
 }
 
-/**
- * Update the display content (separated for clarity)
- */
+// ==================== DISPLAY UPDATE (separated, lightweight) ====================
 void updateDisplay() {
-  // Handle blinking dot timing (500 ms)
   if (millis() - lastBlinkTime > 500) {
     blinkState = !blinkState;
     lastBlinkTime = millis();
@@ -250,10 +251,9 @@ void updateDisplay() {
 
   if (gps.time.isValid() && gps.date.isValid()) {
     LocalTime lt = getLocalTime(gps.date, gps.time);
-    int hour12;
-    const char* ampm;
-    format12Hour(lt.hour, hour12, ampm);
-    display.printf("%02d:%02d:%02d %s\n", hour12, lt.minute, lt.second, ampm);
+    int h12; const char* ampm;
+    format12Hour(lt.hour, h12, ampm);
+    display.printf("%02d:%02d:%02d %s\n", h12, lt.minute, lt.second, ampm);
   } else {
     display.println("--:--:--");
   }
@@ -276,20 +276,20 @@ void updateDisplay() {
   }
   display.setTextSize(1);
 
-  // Draw flashing dot to left of SD icon when logging
   if (sdInserted) {
-    if (isLogging && blinkState) {
+    if (isLogging && blinkState && gps.location.isValid()) {
       display.drawBitmap(83, 0, dot16x16, 16, 16, SH110X_WHITE);
     }
-    // Always draw SD card icon solid
     display.drawBitmap(112, 0, sdIcon16x16, 16, 16, SH110X_WHITE);
   }
 
   display.display();
 }
 
+// ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
+  randomSeed(analogRead(0));  // Seed random number generator
 
   Wire.begin(SDA_PIN, SCL_PIN);
   display.begin(0x3C, true);
@@ -304,38 +304,70 @@ void setup() {
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
 
   SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
+
   if (SD.begin(SD_CS)) {
     Serial.println("SD card initialized.");
     sdInserted = true;
+
+    currentLogFileName = generateLogFileNameWithRandomCode(gps.date);
+    logFile = SD.open(currentLogFileName.c_str(), FILE_WRITE);
+    if (logFile) {
+      Serial.print("Created log file: "); Serial.println(currentLogFileName);
+      if (logFile.size() == 0) {
+        logFile.println("lat,lon,speed_mph,UTC_date,UTC_time,RPM");
+        logFile.flush();
+        writeBlankLines(logFile, 10);
+      }
+    } else {
+      Serial.println("Failed to create log file on startup.");
+      sdInserted = false;
+    }
+
+    // Show boot screen with filename for 3 seconds
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Log file created:");
+    display.println(currentLogFileName);
+    display.display();
+    delay(3000);
+
   } else {
-    Serial.println("No SD card found.");
+    Serial.println("No SD card found. Logging disabled.");
     sdInserted = false;
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("No SD card!");
+    display.display();
   }
 
-  // Initialize last buffer flush time
-  lastBufferFlushTime = millis();
+  lastBufferFlushMillis = millis();
 }
 
+// ==================== MAIN LOOP ====================
 void loop() {
-  // Read all available GPS data
   while (gpsSerial.available()) {
     gps.encode(gpsSerial.read());
-    lastGpsByteTime = millis();
   }
 
-  // Log once per GPS second (sync to GPS UTC time)
-  if (gps.time.isValid()) {
+  if (gps.time.isValid() && gps.date.isValid()) {
     int currentSecond = gps.time.second();
     if (currentSecond != lastLoggedSecond) {
       lastLoggedSecond = currentSecond;
-      logToCSV();
+      if (gps.location.isValid() && sdInserted) {
+        bufferLogLine();
+      }
     }
   }
 
-  // Flush buffer every 5 seconds if data exists
-  if (millis() - lastBufferFlushTime > bufferFlushInterval) {
-    flushLogBuffer();
-    lastBufferFlushTime = millis();
+  if (millis() - lastBufferFlushMillis >= BUFFER_FLUSH_INTERVAL_MS) {
+    if (logLinesCount > 0 && sdInserted) {
+      if (!openLogFileIfNeeded()) {
+        Serial.println("Failed to open log file at flush time");
+      } else {
+        flushLogBuffer();
+      }
+    }
+    lastBufferFlushMillis = millis();
   }
 
   updateDisplay();
