@@ -58,14 +58,17 @@ def create_map(df):
     ).add_to(m)
 
     # Add legend for speed
-    colormap = LinearColormap(
-        colors=[mcolors.to_hex(cmap(0)), mcolors.to_hex(cmap(0.5)), mcolors.to_hex(cmap(1))],
-        vmin=df['Speed'].min(),
-        vmax=df['Speed'].max(),
-        caption='Speed (MPH)'
-    )
-    colormap.add_to(m)
+    cmap = cm.get_cmap('coolwarm')
+num_samples = 11
+colors = [mcolors.to_hex(cmap(x)) for x in [i/(num_samples-1) for i in range(num_samples)]]
 
+colormap = LinearColormap(
+    colors=colors,
+    vmin=df['Speed'].min(),
+    vmax=df['Speed'].max(),
+    caption='Speed (MPH)'
+)
+colormap.add_to(m)
     return m
 
 def format_trip_duration(td):
