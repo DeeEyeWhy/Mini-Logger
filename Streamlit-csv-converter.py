@@ -1,264 +1,262 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import folium
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import matplotlib.cm as cm
 from streamlit_folium import st_folium
-import datetime
 from geopy.distance import geodesic
 from branca.colormap import LinearColormap
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.dates import DateFormatter
 
-st.title("Mini Logger V4.1 CSV Map Converter")
+# ---------- Page setup ----------
+st.set_page_config(page_title="Mini Logger CSV Converter", layout="wide")
+st.title("Mini Logger CSV Map Converter")
 
-uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
+# ---------- Helpers ----------
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename columns to standard: Lat, Lng, Speed, Time, RPM (if present)."""
+    col_map = {c: c for c in df.columns}
+    lc = {c: c.lower().replace(" ", "").replace("_", "") for c in df.columns}
 
-REQUIRED_COLS = ["Lat", "Lng", "Speed", "Time", "RPM"]
+    def find(syns):
+        for orig, key in lc.items():
+            if key in syns:
+                return orig
+        return None
 
-def read_csv_flex(file):
-    """
-    Try to read with header; if required columns missing, retry as headerless with known names.
-    """
-    try:
-        df = pd.read_csv(file, on_bad_lines="skip")
-    except Exception:
-        file.seek(0)
-        df = pd.read_csv(file, names=REQUIRED_COLS, on_bad_lines="skip")
+    lat_col = find({"lat", "latitude"})
+    lng_col = find({"lng", "lon", "longitude"})
+    spd_col = find({"speed", "speedmph", "speed_mph", "mph"})
+    time_col = find({"time", "utcdatetime", "datetime", "timestamp"})
+    rpm_col = find({"rpm"})
 
-    has_all = all(c in df.columns for c in REQUIRED_COLS)
-    if not has_all:
-        # retry as headerless with names
-        file.seek(0)
-        df = pd.read_csv(file, names=REQUIRED_COLS, on_bad_lines="skip")
+    renames = {}
+    if lat_col: renames[lat_col] = "Lat"
+    if lng_col: renames[lng_col] = "Lng"
+    if spd_col: renames[spd_col] = "Speed"
+    if time_col: renames[time_col] = "Time"
+    if rpm_col: renames[rpm_col] = "RPM"
 
-    # Final sanity: ensure all columns exist
-    for c in REQUIRED_COLS:
-        if c not in df.columns:
-            df[c] = np.nan
-    return df[REQUIRED_COLS].copy()
-
-def drop_leading_blank_rows(df):
-    """
-    Drop leading rows that are clearly placeholders (0/0 coords, or NaNs).
-    Keeps interior rows that may be zero-speed but valid coords.
-    """
-    valid_coord = (
-        df["Lat"].between(-90, 90)
-        & df["Lng"].between(-180, 180)
-        & ~((df["Lat"].fillna(0) == 0) & (df["Lng"].fillna(0) == 0))
-    )
-    valid_idx = np.where(valid_coord.values)[0]
-    if len(valid_idx) == 0:
-        return df.iloc[0:0]  # empty
-    first = valid_idx[0]
-    return df.iloc[first:].reset_index(drop=True)
-
-def parse_time_column(df):
-    """
-    Robust time parsing:
-    - Try to_datetime (ISO-like strings)
-    - If that fails a lot, try epoch seconds
-    Returns df with a parsed UTC datetime 'Time' column (or leaves NaT where impossible).
-    """
-    # If already datetime-like, standardize to UTC
-    if pd.api.types.is_datetime64_any_dtype(df["Time"]):
-        df["Time"] = pd.to_datetime(df["Time"], utc=True, errors="coerce")
-        return df
-
-    # First try string -> datetime
-    t1 = pd.to_datetime(df["Time"], utc=True, errors="coerce")
-    valid1 = t1.notna().sum()
-
-    # If not enough valid, try numeric epoch seconds
-    if valid1 < len(df) * 0.5:
-        tnum = pd.to_numeric(df["Time"], errors="coerce")
-        t2 = pd.to_datetime(tnum, unit="s", utc=True, errors="coerce")
-        valid2 = t2.notna().sum()
-        df["Time"] = t2 if valid2 >= valid1 else t1
-    else:
-        df["Time"] = t1
+    df = df.rename(columns=renames)
     return df
 
-def compute_total_time(df):
+def parse_time_series(s: pd.Series) -> pd.Series:
     """
-    Total trip time = last valid timestamp - first valid timestamp (after cleaning).
-    Returns (timedelta or None, nicely formatted string).
+    Parse Time column robustly:
+    - If numeric, auto-detect seconds vs milliseconds since epoch.
+    - If string/datetime, parse with utc=True, then strip tz to make Matplotlib happy.
+    Returns tz-naive pandas datetime64[ns].
     """
-    if not pd.api.types.is_datetime64_any_dtype(df["Time"]):
-        return None, "Unknown"
+    if np.issubdtype(s.dtype, np.number):
+        # Heuristic: ms since epoch if values are large
+        vmax = s.dropna().astype(float).max()
+        unit = "ms" if vmax > 1e11 else "s"
+        ts = pd.to_datetime(s, unit=unit, utc=True, errors="coerce")
+    else:
+        # Try flexible string parsing
+        ts = pd.to_datetime(s, utc=True, errors="coerce")
 
-    times = df["Time"].dropna()
-    if times.empty:
-        return None, "Unknown"
+    # Strip timezone (keep UTC clock values but make tz-naive for Matplotlib)
+    return ts.dt.tz_convert(None) if ts.dt.tz is not None else ts.dt.tz_localize(None)
 
-    total = times.iloc[-1] - times.iloc[0]
-    seconds = int(total.total_seconds())
-    if seconds < 0:
-        return None, "Unknown"
-    return total, str(datetime.timedelta(seconds=seconds))
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce numeric cols, drop invalid rows, sort by time."""
+    for col in ["Lat", "Lng", "Speed", "RPM"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-def create_map(df):
-    """
-    Folium map with speed-colored path, start/end pins, fastest flag, and color legend.
-    """
-    # Normalize speed values for colors
-    norm = mcolors.Normalize(vmin=df["Speed"].min(), vmax=df["Speed"].max())
-    cmap = cm.get_cmap("coolwarm")
+    # Drop rows with missing essentials
+    req = ["Lat", "Lng", "Time"]
+    for r in req:
+        if r not in df.columns:
+            st.error(f"Missing required column: **{r}**")
+            st.stop()
 
-    center_lat = float(df["Lat"].iloc[0])
-    center_lng = float(df["Lng"].iloc[0])
-    m = folium.Map(location=[center_lat, center_lng], zoom_start=12)
+    df = df.dropna(subset=req)
 
-    # Draw colored path
-    if len(df) >= 2:
+    # Keep sane values
+    df = df[
+        df["Lat"].between(-90, 90) &
+        df["Lng"].between(-180, 180)
+    ]
+    if "Speed" in df.columns:
+        df = df[df["Speed"] >= 0]
+    if "RPM" in df.columns:
+        df = df[df["RPM"] >= 0]
+
+    # Sort by time
+    df = df.sort_values("Time").reset_index(drop=True)
+    return df
+
+def create_speed_colormap(min_speed, max_speed):
+    # 3-stop gradient, works nicely for legends
+    return LinearColormap(
+        colors=["#2c7bb6", "#ffff8c", "#d7191c"],  # blue -> yellow -> red
+        vmin=float(min_speed),
+        vmax=float(max_speed)
+    )
+
+def draw_map(df: pd.DataFrame) -> folium.Map:
+    # Center map on first valid point
+    m = folium.Map(location=[df["Lat"].iloc[0], df["Lng"].iloc[0]], zoom_start=12, control_scale=True)
+
+    # Draw colored path by Speed if present
+    if "Speed" in df.columns and not df["Speed"].isna().all():
+        min_s, max_s = float(df["Speed"].min()), float(df["Speed"].max())
+        cmap = create_speed_colormap(min_s, max_s)
+
         for i in range(1, len(df)):
-            color = mcolors.to_hex(cmap(norm(df["Speed"].iloc[i])))
+            color = cmap(df["Speed"].iloc[i]) if pd.notna(df["Speed"].iloc[i]) else "#3388ff"
             folium.PolyLine(
-                locations=[(df.Lat.iloc[i - 1], df.Lng.iloc[i - 1]),
-                           (df.Lat.iloc[i], df.Lng.iloc[i])],
+                locations=[(df["Lat"].iloc[i-1], df["Lng"].iloc[i-1]),
+                           (df["Lat"].iloc[i], df["Lng"].iloc[i])],
                 color=color,
                 weight=4,
-                opacity=0.8,
+                opacity=0.9
             ).add_to(m)
 
-    # Add start pin
+        cmap.caption = "Speed (MPH)"
+        cmap.add_to(m)
+    else:
+        # Plain line if no speed
+        folium.PolyLine(
+            locations=list(zip(df["Lat"], df["Lng"])),
+            weight=4,
+            opacity=0.9
+        ).add_to(m)
+
+    # Start marker
     folium.Marker(
-        location=(df.Lat.iloc[0], df.Lng.iloc[0]),
+        location=(df["Lat"].iloc[0], df["Lng"].iloc[0]),
         popup="Start",
-        icon=folium.Icon(color="green", icon="play"),
+        icon=folium.Icon(color="green", icon="play")
     ).add_to(m)
 
-    # Add end pin
+    # End marker
     folium.Marker(
-        location=(df.Lat.iloc[-1], df.Lng.iloc[-1]),
+        location=(df["Lat"].iloc[-1], df["Lng"].iloc[-1]),
         popup="End",
-        icon=folium.Icon(color="blue", icon="stop"),
+        icon=folium.Icon(color="blue", icon="stop")
     ).add_to(m)
 
-    # Add fastest speed pin
-    max_speed_idx = df["Speed"].idxmax()
-    popup_text = f"Fastest Point: {df['Speed'].iloc[max_speed_idx]:.1f} mph"
-    if pd.api.types.is_datetime64_any_dtype(df["Time"]):
-        popup_text += f"<br>Time: {df['Time'].iloc[max_speed_idx]}"
-
-    folium.Marker(
-        location=(df.Lat.iloc[max_speed_idx], df.Lng.iloc[max_speed_idx]),
-        popup=folium.Popup(popup_text, max_width=260),
-        icon=folium.Icon(color="red", icon="flag"),
-    ).add_to(m)
-
-    # Add legend for speed
-    colormap = LinearColormap(
-        colors=[mcolors.to_hex(cmap(0)), mcolors.to_hex(cmap(0.5)), mcolors.to_hex(cmap(1))],
-        vmin=float(df["Speed"].min()),
-        vmax=float(df["Speed"].max()),
-        caption="Speed (MPH)",
-    )
-    colormap.add_to(m)
+    # Fastest point marker (if Speed exists)
+    if "Speed" in df.columns and not df["Speed"].isna().all():
+        max_idx = int(df["Speed"].idxmax())
+        popup_text = f"Fastest: {df['Speed'].iloc[max_idx]:.1f} mph"
+        if pd.api.types.is_datetime64_any_dtype(df["Time"]):
+            popup_text += f"<br>Time: {df['Time'].iloc[max_idx]}"
+        folium.Marker(
+            location=(df["Lat"].iloc[max_idx], df["Lng"].iloc[max_idx]),
+            popup=folium.Popup(popup_text, max_width=260),
+            icon=folium.Icon(color="red", icon="flag")
+        ).add_to(m)
 
     return m
 
-def compute_distance_miles(df):
-    """
-    Sum geodesic distance (miles) between sequential valid points.
-    """
-    if len(df) < 2:
-        return 0.0
-    total = 0.0
+def summarize_trip(df: pd.DataFrame):
+    # Distance in miles
+    total_miles = 0.0
+    lat = df["Lat"].to_numpy()
+    lng = df["Lng"].to_numpy()
     for i in range(1, len(df)):
-        total += geodesic(
-            (df.Lat.iloc[i - 1], df.Lng.iloc[i - 1]),
-            (df.Lat.iloc[i], df.Lng.iloc[i]),
-        ).miles
-    return total
+        total_miles += geodesic((lat[i-1], lng[i-1]), (lat[i], lng[i])).miles
 
-if uploaded_file:
-    # ---------- LOAD ----------
-    df = read_csv_flex(uploaded_file)
+    # Duration
+    start_t = df["Time"].iloc[0]
+    end_t = df["Time"].iloc[-1]
+    duration = end_t - start_t
+    # Make a clean H:MM:SS string
+    duration_str = str(pd.to_timedelta(duration))
 
-    # ---------- CLEAN NUMERICS ----------
-    for col in ["Lat", "Lng", "Speed", "RPM"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Speeds
+    top_speed = float(df["Speed"].max()) if "Speed" in df.columns else None
+    avg_speed = float(df["Speed"].mean()) if "Speed" in df.columns else None
 
-    # Drop obvious garbage rows globally
-    df = df.dropna(subset=["Lat", "Lng", "Speed"])  # keep RPM NaN if needed; we'll coerce to 0 later
-    df = df[
-        (df["Lat"].between(-90, 90))
-        & (df["Lng"].between(-180, 180))
-        & (df["Speed"] >= 0)
-    ]
+    return {
+        "start": start_t,
+        "end": end_t,
+        "duration": duration,
+        "duration_str": duration_str,
+        "distance_mi": total_miles,
+        "top_speed": top_speed,
+        "avg_speed": avg_speed
+    }
 
-    # Drop only the LEADING placeholder rows (0/0 coords etc.), keep interior zero-speed if coords are valid
-    df = drop_leading_blank_rows(df)
+def plot_speed_rpm(df: pd.DataFrame):
+    x = df["Time"]
+    fig, ax1 = plt.subplots(figsize=(10, 5))
 
-    # RPM: if missing, set to 0
-    df["RPM"] = pd.to_numeric(df["RPM"], errors="coerce").fillna(0).clip(lower=0)
+    # Speed
+    if "Speed" in df.columns:
+        ax1.plot(x, df["Speed"], label="Speed", color="tab:red")
+        ax1.set_ylabel("Speed (MPH)", color="tab:red")
+        ax1.tick_params(axis="y", labelcolor="tab:red")
 
-    # ---------- TIME PARSING ----------
-    df = parse_time_column(df)
+    # RPM (secondary axis)
+    if "RPM" in df.columns:
+        ax2 = ax1.twinx()
+        ax2.plot(x, df["RPM"], label="RPM", color="tab:blue")
+        ax2.set_ylabel("RPM", color="tab:blue")
+        ax2.tick_params(axis="y", labelcolor="tab:blue")
 
-    # If still NaT everywhere, we cannot compute trip time; map and plots can still work
-    if df.empty:
-        st.error("No valid GPS data found after cleaning.")
+    ax1.set_xlabel("Time (UTC)")
+    ax1.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d\n%H:%M:%S"))
+    fig.tight_layout()
+    return fig
+
+# ---------- UI ----------
+uploaded = st.file_uploader("Upload CSV file", type=["csv"])
+
+if uploaded:
+    # Try read with header; if user exported headerless, try fallback
+    try:
+        df_raw = pd.read_csv(uploaded)
+    except Exception:
+        uploaded.seek(0)
+        df_raw = pd.read_csv(uploaded, header=None)
+        # If headerless, assign the expected columns (best-effort)
+        df_raw.columns = ["Lat", "Lng", "Speed", "Time", "RPM"][: df_raw.shape[1]]
+
+    df = normalize_columns(df_raw.copy())
+
+    # Ensure Time column exists after normalization
+    if "Time" not in df.columns:
+        st.error("Could not detect a time column (e.g., Time / UTC_datetime / timestamp).")
         st.stop()
 
-    # ---------- STATS ----------
-    top_speed = float(df["Speed"].max())
-    avg_speed = float(df["Speed"].mean())
-    total_distance_miles = compute_distance_miles(df)
+    # Parse time robustly and clean
+    df["Time"] = parse_time_series(df["Time"])
+    df = clean_dataframe(df)
 
-    total_td, total_time_str = compute_total_time(df)
+    if df.empty:
+        st.error("No valid GPS rows after cleaning.")
+        st.stop()
 
-    # ---------- SUMMARY ----------
-    st.markdown("### Summary Statistics")
-    st.markdown(f"- **Top Speed:** {top_speed:.1f} mph")
-    st.markdown(f"- **Average Speed:** {avg_speed:.1f} mph")
-    st.markdown(f"- **Total Distance:** {total_distance_miles:.2f} miles")
-    st.markdown(f"- **Total Trip Time:** {total_time_str}")
+    # Show summary
+    stats = summarize_trip(df)
 
-    # ---------- MAP ----------
+    st.subheader("Summary Statistics")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Top Speed", f"{stats['top_speed']:.1f} mph" if stats["top_speed"] is not None else "—")
+    with c2:
+        st.metric("Average Speed", f"{stats['avg_speed']:.1f} mph" if stats["avg_speed"] is not None else "—")
+    with c3:
+        st.metric("Total Distance", f"{stats['distance_mi']:.2f} mi")
+    with c4:
+        st.metric("Trip Time", stats["duration_str"])
+
+    st.caption(f"Start: {stats['start']}  |  End: {stats['end']} (UTC)")
+
+    # Map
     st.subheader("Interactive GPS Map")
-    try:
-        m = create_map(df)
-        st_folium(m, width=800, height=520)
-    except Exception as e:
-        st.warning(f"Could not render map: {e}")
+    m = draw_map(df)
+    st_folium(m, width=900, height=540)
 
-    # ---------- PLOTS ----------
+    # Charts
     st.subheader("Speed & RPM Over Time")
-    fig, ax1 = plt.subplots(figsize=(10, 5))
-    if pd.api.types.is_datetime64_any_dtype(df["Time"]):
-        x = df["Time"]
-        ax1.set_xlabel("Time (UTC)")
-    else:
-        x = df.index
-        ax1.set_xlabel("Sample Index")
-
-    ax1.set_ylabel("Speed (MPH)", color="tab:red")
-    ax1.plot(x, df["Speed"], color="tab:red", label="Speed")
-    ax1.tick_params(axis="y", labelcolor="tab:red")
-
-    ax2 = ax1.twinx()
-    ax2.set_ylabel("RPM", color="tab:blue")
-    ax2.plot(x, df["RPM"], color="tab:blue", label="RPM")
-    ax2.tick_params(axis="y", labelcolor="tab:blue")
-
-    fig.tight_layout()
-    plt.title("Speed & RPM Over Time")
+    fig = plot_speed_rpm(df)
     st.pyplot(fig)
 
-    # ---------- OPTIONAL: DOWNLOAD CLEANED CSV ----------
-    cleaned = df.copy()
-    # Standardize Time column to ISO UTC string for export
-    if pd.api.types.is_datetime64_any_dtype(cleaned["Time"]):
-        cleaned["Time"] = cleaned["Time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
-    csv_bytes = cleaned.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download Cleaned CSV",
-        data=csv_bytes,
-        file_name="cleaned_log.csv",
-        mime="text/csv",
-    )
 else:
     st.info("Upload a CSV file to get started.")
