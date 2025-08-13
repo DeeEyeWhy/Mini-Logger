@@ -11,7 +11,7 @@ from geopy.distance import geodesic
 from branca.colormap import LinearColormap
 from io import BytesIO
 
-st.title("Mini Logger V4.2 CSV Map Converter")
+st.title("Mini Logger V4.1 CSV Map Converter")
 
 uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
 
