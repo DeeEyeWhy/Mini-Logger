@@ -28,7 +28,7 @@
 
 // Timing for button handling (ms)
 #define BUTTON_DEBOUNCE_DELAY 50
-#define BUTTON_LONG_PRESS_TIME 1000
+#define BUTTON_LONG_PRESS_TIME 2000
 
 // Logging timing
 #define FLUSH_INTERVAL_SECONDS 10
