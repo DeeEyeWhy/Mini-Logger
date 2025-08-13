@@ -21,7 +21,7 @@ def create_map(df):
     # Create Folium map centered on first point
     m = folium.Map(location=[df.Lat.iloc[0], df.Lng.iloc[0]], zoom_start=12)
 
-    # Draw colored path
+    # Draw colored path with speed-based color
     for i in range(1, len(df)):
         color = mcolors.to_hex(cmap(norm(df['Speed'].iloc[i])))
         folium.PolyLine(
@@ -57,18 +57,17 @@ def create_map(df):
         icon=folium.Icon(color="red", icon="flag")
     ).add_to(m)
 
-    # Add legend for speed
-    cmap = cm.get_cmap('coolwarm')
-num_samples = 11
-colors = [mcolors.to_hex(cmap(x)) for x in [i/(num_samples-1) for i in range(num_samples)]]
+    # Add legend for speed with smooth gradient matching map
+    num_samples = 11
+    colors = [mcolors.to_hex(cmap(x)) for x in [i/(num_samples-1) for i in range(num_samples)]]
+    colormap = LinearColormap(
+        colors=colors,
+        vmin=df['Speed'].min(),
+        vmax=df['Speed'].max(),
+        caption='Speed (MPH)'
+    )
+    colormap.add_to(m)
 
-colormap = LinearColormap(
-    colors=colors,
-    vmin=df['Speed'].min(),
-    vmax=df['Speed'].max(),
-    caption='Speed (MPH)'
-)
-colormap.add_to(m)
     return m
 
 def format_trip_duration(td):
@@ -92,7 +91,7 @@ if uploaded_file:
     # Drop invalid rows
     df.dropna(subset=['Lat', 'Lng', 'Speed', 'RPM'], inplace=True)
 
-    # Filter ranges
+    # Filter valid ranges
     df = df[
         (df['Lat'].between(-90, 90)) &
         (df['Lng'].between(-180, 180)) &
@@ -100,18 +99,16 @@ if uploaded_file:
         (df['RPM'] >= 0)
     ]
 
-    # Parse Time as datetime (expecting unix timestamp or ISO)
+    # Parse Time as datetime (unix timestamp or ISO)
     try:
-        # Try as unix epoch seconds if numeric
         if pd.api.types.is_numeric_dtype(df['Time']):
             df['Time'] = pd.to_datetime(df['Time'], unit='s', utc=True)
         else:
             df['Time'] = pd.to_datetime(df['Time'], utc=True)
     except Exception:
-        # fallback: just coerce
         df['Time'] = pd.to_datetime(df['Time'], errors='coerce', utc=True)
 
-    # Drop rows with invalid times
+    # Drop invalid times
     df.dropna(subset=['Time'], inplace=True)
 
     if df.empty:
