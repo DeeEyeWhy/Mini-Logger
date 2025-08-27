@@ -4,7 +4,7 @@ import folium
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.cm as cm
-from streamlit import components
+from streamlit_folium import st_folium
 import datetime
 from geopy.distance import geodesic
 from branca.colormap import LinearColormap
@@ -145,11 +145,10 @@ if uploaded_file:
     st.markdown(f"- **Total Time:** {total_time_str}")
     st.markdown(f"- **Total Distance:** {total_distance_miles:.2f} miles")
 
-    # Show interactive map without focus overlay
+    # Show interactive map
     st.subheader("Interactive GPS Map")
     folium_map = create_map(df)
-    map_html = folium_map._repr_html_()
-    components.html(map_html, width=700, height=500)
+    st_folium(folium_map, width=700, height=500)
 
     # Speed & RPM plot
     st.subheader("Speed & RPM Over Time")
