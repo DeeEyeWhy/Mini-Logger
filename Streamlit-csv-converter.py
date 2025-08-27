@@ -18,8 +18,17 @@ def create_map(df):
     norm = mcolors.Normalize(vmin=df['Speed'].min(), vmax=df['Speed'].max())
     cmap = cm.get_cmap('coolwarm')
 
-    # Create Folium map centered on first point
-    m = folium.Map(location=[df.Lat.iloc[0], df.Lng.iloc[0]], zoom_start=12)
+    # Create Folium map centered on first point, no default tiles
+    m = folium.Map(location=[df.Lat.iloc[0], df.Lng.iloc[0]], zoom_start=12, tiles=None)
+
+    # Add Esri World Imagery (satellite)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri",
+        name="Esri Satellite",
+        overlay=False,
+        control=True
+    ).add_to(m)
 
     # Draw colored path with speed-based color
     for i in range(1, len(df)):
