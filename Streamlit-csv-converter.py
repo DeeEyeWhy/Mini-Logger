@@ -148,6 +148,21 @@ if uploaded_file:
     # Show interactive map
     st.subheader("Interactive GPS Map")
     folium_map = create_map(df)
+
+    # Remove the hover/dark overlay effect
+    st.markdown(
+        """
+        <style>
+        iframe { 
+            filter: none !important; 
+            box-shadow: none !important; 
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # Display the map normally
     st_folium(folium_map, width=700, height=500)
 
     # Speed & RPM plot
