@@ -148,7 +148,7 @@ if uploaded_file:
     # Show interactive map
     st.subheader("Interactive GPS Map")
     folium_map = create_map(df)
-    st_folium(folium_map, width=700, height=500, scroll_zoom=False)
+    st_folium(folium_map, width=700, height=500)
 
     # Speed & RPM plot
     st.subheader("Speed & RPM Over Time")
