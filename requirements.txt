@@ -2,5 +2,5 @@ streamlit
 pandas
 folium
 matplotlib
-streamlit-folium==0.12.3
+streamlit-folium==0.25.1
 geopy
