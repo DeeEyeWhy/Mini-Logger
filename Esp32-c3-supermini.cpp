@@ -11,8 +11,8 @@
     - 2 pulses/rev
     - RPM computed at 10 Hz (RPM_UPDATE_HZ)
     - Ones digit forced to 0
+    - RPM text only appears after first pulse is sensed
     - Same RPM used for OLED + CSV
-    - RPM drawn in large font just below MPH, only if > 0
 */
 
 #include <Wire.h>
@@ -81,9 +81,10 @@ File logFile;
 unsigned long lastBufferFlushMillis = 0;
 
 // RPM state
-int RPM = 0; // <-- used for BOTH OLED + CSV (ones digit forced to 0)
+int RPM = 0; // used for OLED + CSV
 volatile unsigned long pulseCount = 0;
 unsigned long lastRPMSampleMillis = 0;
+bool rpmSeen = false; // tracks if first pulse has ever been detected
 
 // Button handling
 bool buttonJustClicked = false;
@@ -117,34 +118,28 @@ const unsigned long FILE_CREATED_MSG_DURATION_MS = 3000; // 3 seconds
 
 // GPS & date/time helpers
 struct LocalTime { int hour; int minute; int second; };
-
 unsigned long loggingStartMillis = 0; // <-- fixed declaration
 
 // ==================== RPM ISR ====================
 void IRAM_ATTR hallISR() { pulseCount++; }
 
-// Convert GPS time + longitude to local time (integer hours offset)
+// Convert GPS time + longitude to local time
 LocalTime getLocalTime(TinyGPSDate date, TinyGPSTime time, double longitude) {
-  // Compute timezone from longitude (negative west)
-  int timezoneOffsetHours = -5; // standard time
-  // simple DST approx: March second Sunday → Nov first Sunday
+  int timezoneOffsetHours = -5;
   int month = date.month();
   int day = date.day();
   int hour = time.hour();
   if (month>3 && month<11) timezoneOffsetHours = -5;
-  else if (month==3 && day>=8) timezoneOffsetHours = -4;  // crude approximation
+  else if (month==3 && day>=8) timezoneOffsetHours = -4;
   else if (month==11 && day<=7) timezoneOffsetHours = -4;
   int h = time.hour() + timezoneOffsetHours;
   int m = time.minute();
   int s = time.second();
   
-  // Wrap seconds
   if (s >= 60) { s -= 60; m += 1; }
   if (s < 0)   { s += 60; m -= 1; }
-  // Wrap minutes
   if (m >= 60) { m -= 60; h += 1; }
   if (m < 0)   { m += 60; h -= 1; }
-  // Wrap hours
   if (h >= 24) h -= 24;
   if (h < 0)   { h += 24; }
   
@@ -159,7 +154,6 @@ void format12Hour(int hour24, int &hour12, const char* &amPm) {
 }
 
 // ==================== FILENAME (8.3 safe) ====================
-// Produces LYYMMDDxx.CSV where xx is 00..99
 void generateNextAvailableLogFileName(char *outFilename, size_t outSize, int yy, int mm, int dd) {
   for (int i = 0; i < 100; ++i) {
     snprintf(outFilename, outSize, "/L%02d%02d%02d%02d.CSV", yy, mm, dd, i);
@@ -179,11 +173,7 @@ bool openLogFileNew() {
   currentLogFileName = String(fn);
 
   logFile = SD.open(currentLogFileName.c_str(), FILE_WRITE);
-  if (!logFile) {
-    Serial.print("Failed to create new log file: "); Serial.println(currentLogFileName);
-    return false;
-  }
-  Serial.print("New log file created: "); Serial.println(currentLogFileName);
+  if (!logFile) return false;
   logFile.println("lat,lon,speed_mph,UTC_datetime,RPM");
   logFile.flush();
   return true;
@@ -235,7 +225,7 @@ void bufferLogLine() {
     gps.time.isValid() ? gps.time.hour() : 0,
     gps.time.isValid() ? gps.time.minute() : 0,
     gps.time.isValid() ? gps.time.second() : 0,
-    RPM // <- SAME RPM as OLED, ones digit already forced to 0
+    RPM
   );
 
   if (len < 0) return;
@@ -271,7 +261,6 @@ void updateDisplayLogging() {
   display.setCursor(0,0);
 
   if (gps.time.isValid() && gps.date.isValid()) {
-    double lon = gps.location.isValid() ? gps.location.lng() : 0.0;
     LocalTime lt = getLocalTime(gps.date, gps.time, gps.location.isValid() ? gps.location.lng() : 0.0);
     int h12; const char* ampm;
     format12Hour(lt.hour,h12,ampm);
@@ -286,13 +275,13 @@ void updateDisplayLogging() {
 
   // MPH (large)
   display.setTextSize(3);
-  display.setCursor(0, 24); // explicitly position MPH line
-  if (gps.speed.isValid()) display.printf("MPH:%3d", (int)(gps.speed.mph()+0.5));
+  display.setCursor(0, 24);
+  if (gps.speed.isValid()) display.printf("MPH:%3d", (int)(gps.speed.mph() + 0.5));
   else display.println("MPH: --");
 
-  // RPM (large, only if > 0), ones digit already 0
-  if (RPM > 0) {
-    display.setCursor(0, 52); // just below MPH (24px tall per line at size 3)
+  // RPM (only show if rpmSeen is true)
+  if (rpmSeen) {
+    display.setCursor(0, 52);
     display.printf("RPM:%4d", RPM);
   }
 
@@ -388,7 +377,7 @@ void loop() {
   unsigned long now=millis();
 
   // ==== RPM update at 10 Hz (ones digit forced to 0) ====
-  const unsigned long rpmInterval = 1000UL / RPM_UPDATE_HZ; // e.g., 100 ms
+  const unsigned long rpmInterval = 1000UL / RPM_UPDATE_HZ;
   if (now - lastRPMSampleMillis >= rpmInterval) {
     unsigned long elapsed = now - lastRPMSampleMillis;
     lastRPMSampleMillis = now;
@@ -397,6 +386,8 @@ void loop() {
     unsigned long pulses = pulseCount;
     pulseCount = 0;
     interrupts();
+
+    if (pulses > 0) rpmSeen = true;
 
     float rpmRaw = (elapsed > 0) ? ((float)pulses / PULSES_PER_REV) * (60000.0f / (float)elapsed) : 0.0f;
     int rpmInt = (int)rpmRaw;
