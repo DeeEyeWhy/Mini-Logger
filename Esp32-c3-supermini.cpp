@@ -5,6 +5,14 @@
   - Debounced button (short click toggles logging)
   - Buffered logging flushed every FLUSH_INTERVAL_SECONDS
   - OLED shows local time based on GPS longitude
+
+  + Added:
+    - Hall-effect RPM on IO1
+    - 2 pulses/rev
+    - RPM computed at 10 Hz (RPM_UPDATE_HZ)
+    - Ones digit forced to 0
+    - Same RPM used for OLED + CSV
+    - RPM drawn in large font just below MPH, only if > 0
 */
 
 #include <Wire.h>
@@ -25,6 +33,11 @@
 #define SD_CLK  7
 #define SD_MISO 6
 #define BUTTON_PIN 10  // Button to GND (INPUT_PULLUP)
+
+// Hall effect RPM config
+#define HALL_PIN 1            // Hall sensor signal on IO1
+#define PULSES_PER_REV 2      // 2 pulses per revolution
+#define RPM_UPDATE_HZ 10      // compute RPM at 10 Hz (every 100 ms)
 
 // Timing for button handling (ms)
 #define BUTTON_DEBOUNCE_DELAY 50
@@ -67,9 +80,10 @@ String currentLogFileName = "";
 File logFile;
 unsigned long lastBufferFlushMillis = 0;
 
-int RPM = 0; // optional; update externally if you have RPM sensor
-
-unsigned long loggingStartMillis = 0; // <-- fixed declaration
+// RPM state
+int RPM = 0; // <-- used for BOTH OLED + CSV (ones digit forced to 0)
+volatile unsigned long pulseCount = 0;
+unsigned long lastRPMSampleMillis = 0;
 
 // Button handling
 bool buttonJustClicked = false;
@@ -104,17 +118,22 @@ const unsigned long FILE_CREATED_MSG_DURATION_MS = 3000; // 3 seconds
 // GPS & date/time helpers
 struct LocalTime { int hour; int minute; int second; };
 
+unsigned long loggingStartMillis = 0; // <-- fixed declaration
+
+// ==================== RPM ISR ====================
+void IRAM_ATTR hallISR() { pulseCount++; }
+
 // Convert GPS time + longitude to local time (integer hours offset)
 LocalTime getLocalTime(TinyGPSDate date, TinyGPSTime time, double longitude) {
   // Compute timezone from longitude (negative west)
   int timezoneOffsetHours = -5; // standard time
-// simple DST approx: March second Sunday → Nov first Sunday
-int month = date.month();
-int day = date.day();
-int hour = time.hour();
-if (month>3 && month<11) timezoneOffsetHours = -5;
-else if (month==3 && day>=8) timezoneOffsetHours = -4;  // crude approximation
-else if (month==11 && day<=7) timezoneOffsetHours = -4;
+  // simple DST approx: March second Sunday → Nov first Sunday
+  int month = date.month();
+  int day = date.day();
+  int hour = time.hour();
+  if (month>3 && month<11) timezoneOffsetHours = -5;
+  else if (month==3 && day>=8) timezoneOffsetHours = -4;  // crude approximation
+  else if (month==11 && day<=7) timezoneOffsetHours = -4;
   int h = time.hour() + timezoneOffsetHours;
   int m = time.minute();
   int s = time.second();
@@ -216,7 +235,7 @@ void bufferLogLine() {
     gps.time.isValid() ? gps.time.hour() : 0,
     gps.time.isValid() ? gps.time.minute() : 0,
     gps.time.isValid() ? gps.time.second() : 0,
-    RPM
+    RPM // <- SAME RPM as OLED, ones digit already forced to 0
   );
 
   if (len < 0) return;
@@ -253,7 +272,7 @@ void updateDisplayLogging() {
 
   if (gps.time.isValid() && gps.date.isValid()) {
     double lon = gps.location.isValid() ? gps.location.lng() : 0.0;
-   LocalTime lt = getLocalTime(gps.date, gps.time, gps.location.isValid() ? gps.location.lng() : 0.0);
+    LocalTime lt = getLocalTime(gps.date, gps.time, gps.location.isValid() ? gps.location.lng() : 0.0);
     int h12; const char* ampm;
     format12Hour(lt.hour,h12,ampm);
     display.printf("%02d:%02d:%02d %s\n",h12,lt.minute,lt.second,ampm);
@@ -265,11 +284,21 @@ void updateDisplayLogging() {
   if (gps.satellites.isValid()) display.printf("Sats: %d\n", gps.satellites.value());
   else display.println("Sats: --");
 
+  // MPH (large)
   display.setTextSize(3);
-  if (gps.speed.isValid()) display.printf("MPH:%3d",(int)(gps.speed.mph()+0.5));
+  display.setCursor(0, 24); // explicitly position MPH line
+  if (gps.speed.isValid()) display.printf("MPH:%3d", (int)(gps.speed.mph()+0.5));
   else display.println("MPH: --");
+
+  // RPM (large, only if > 0), ones digit already 0
+  if (RPM > 0) {
+    display.setCursor(0, 52); // just below MPH (24px tall per line at size 3)
+    display.printf("RPM:%4d", RPM);
+  }
+
   display.setTextSize(1);
 
+  // Icons
   if (sdInserted) {
     if (isLogging && blinkState && gps.location.isValid())
       display.drawBitmap(83,0,dot16x16,16,16,SH110X_WHITE);
@@ -325,6 +354,12 @@ void setup() {
   Serial.begin(115200);
   randomSeed(analogRead(0));
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Hall sensor interrupt
+  pinMode(HALL_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallISR, FALLING);
+  lastRPMSampleMillis = millis();
+
   Wire.begin(SDA_PIN,SCL_PIN);
   display.begin(0x3C,true);
   display.setRotation(0);
@@ -334,6 +369,7 @@ void setup() {
   display.setCursor(0,0);
   display.println("Initializing...");
   display.display();
+
   gpsSerial.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   SPI.begin(SD_CLK,SD_MISO,SD_MOSI,SD_CS);
   if (SD.begin(SD_CS)) { sdInserted=true; bottomMessage="SD Ready"; bottomMessageTimestamp=millis(); }
@@ -350,6 +386,22 @@ void loop() {
   checkSDCardPresence();
 
   unsigned long now=millis();
+
+  // ==== RPM update at 10 Hz (ones digit forced to 0) ====
+  const unsigned long rpmInterval = 1000UL / RPM_UPDATE_HZ; // e.g., 100 ms
+  if (now - lastRPMSampleMillis >= rpmInterval) {
+    unsigned long elapsed = now - lastRPMSampleMillis;
+    lastRPMSampleMillis = now;
+
+    noInterrupts();
+    unsigned long pulses = pulseCount;
+    pulseCount = 0;
+    interrupts();
+
+    float rpmRaw = (elapsed > 0) ? ((float)pulses / PULSES_PER_REV) * (60000.0f / (float)elapsed) : 0.0f;
+    int rpmInt = (int)rpmRaw;
+    RPM = (rpmInt / 10) * 10; // force ones digit to 0
+  }
 
   if (buttonJustClicked) {
     if ((now-lastToggleMillis)>=TOGGLE_COOLDOWN_MS) {
