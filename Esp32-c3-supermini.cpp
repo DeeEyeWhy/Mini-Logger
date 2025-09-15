@@ -1,18 +1,19 @@
 /*
-  Mini Logger - Full Sketch
+  Mini Logger - Full Sketch (Safe RPM ISR)
   - 8.3-safe filenames: /LYYMMDDxx.CSV
   - SD hotplug detection
   - Debounced button (short click toggles logging)
   - Buffered logging flushed every FLUSH_INTERVAL_SECONDS
   - OLED shows local time based on GPS longitude
 
-  + Added:
-    - Hall-effect RPM on IO1
-    - 2 pulses/rev
-    - RPM computed at 10 Hz (RPM_UPDATE_HZ)
-    - Ones digit forced to 0
-    - RPM text only appears after first pulse is sensed
-    - Same RPM used for OLED + CSV
+  + Safe WiFi tachometer–style RPM:
+    - Hall-effect RPM on IO1 (HALL_PIN 1)
+    - ISR only sets timestamp & flag
+    - RPM computed in main loop
+    - lastPulseTime tracked safely
+    - rpm reset to 0 if no pulse for 2000 ms
+    - Same rpm used for OLED + CSV
+    - RPM text drawn only when rpm > 0
 */
 
 #include <Wire.h>
@@ -26,18 +27,16 @@
 // Pins
 #define SDA_PIN 20
 #define SCL_PIN 21
-#define GPS_RX  3    // GPS TX -> ESP32 RX
-#define GPS_TX  4    // GPS RX <- ESP32 TX
+#define GPS_RX  3
+#define GPS_TX  4
 #define SD_CS   9
 #define SD_MOSI 8
 #define SD_CLK  7
 #define SD_MISO 6
-#define BUTTON_PIN 10  // Button to GND (INPUT_PULLUP)
+#define BUTTON_PIN 10
 
 // Hall effect RPM config
-#define HALL_PIN 1            // Hall sensor signal on IO1
-#define PULSES_PER_REV 2      // 2 pulses per revolution
-#define RPM_UPDATE_HZ 10      // compute RPM at 10 Hz (every 100 ms)
+#define HALL_PIN 1  // Hall sensor signal on IO1
 
 // Timing for button handling (ms)
 #define BUTTON_DEBOUNCE_DELAY 50
@@ -80,289 +79,278 @@ String currentLogFileName = "";
 File logFile;
 unsigned long lastBufferFlushMillis = 0;
 
-// RPM state
-int RPM = 0; // used for OLED + CSV
-volatile unsigned long pulseCount = 0;
-unsigned long lastRPMSampleMillis = 0;
-bool rpmSeen = false; // tracks if first pulse has ever been detected
+unsigned long loggingStartMillis = 0;
 
-// Button handling
+// ==================== RPM (Safe ISR) ====================
+volatile unsigned long lastPulseTime = 0;
+volatile bool pulseDetected = false;
+
+unsigned long rpm = 0;
+unsigned long lastRpmCalcTime = 0;
+
+void IRAM_ATTR onPulse() {
+  unsigned long now = millis();
+  if (now - lastPulseTime > 10) {  // 10ms debounce
+    lastPulseTime = now;
+    pulseDetected = true;           // just set flag
+  }
+}
+
+void updateRpm() {
+  unsigned long now = millis();
+  static unsigned long lastPulseTimeCopy = 0;
+
+  // safely copy volatile variables
+  noInterrupts();
+  unsigned long pulseTime = lastPulseTime;
+  bool detected = pulseDetected;
+  pulseDetected = false;
+  interrupts();
+
+  if (detected) {
+    unsigned long interval = pulseTime - lastPulseTimeCopy;
+    if (interval > 0) rpm = 60000 / interval / 2; // 2 pulses per rev
+    lastPulseTimeCopy = pulseTime;
+    lastRpmCalcTime = now;
+  }
+
+  if (now - lastRpmCalcTime > 2000) rpm = 0; // reset if no pulse for 2 sec
+}
+
+// ==================== BUTTON ====================
 bool buttonJustClicked = false;
 bool buttonLongPressed = false;
 unsigned long buttonPressStart = 0;
 unsigned long buttonLastChange = 0;
-bool lastButtonReading = HIGH; // raw last reading
-bool buttonStableState = HIGH; // debounced stable state
+bool lastButtonReading = HIGH;
+bool buttonStableState = HIGH;
 
-// Toggle cooldown
 unsigned long lastToggleMillis = 0;
-const unsigned long TOGGLE_COOLDOWN_MS = 5000; // 5 seconds
+const unsigned long TOGGLE_COOLDOWN_MS = 5000;
 
-// Bottom message display
 String bottomMessage = "";
 unsigned long bottomMessageTimestamp = 0;
-const unsigned long BOTTOM_MESSAGE_DURATION_MS = 3000; // 3 seconds
+const unsigned long BOTTOM_MESSAGE_DURATION_MS = 3000;
 
-// Display refresh control
 unsigned long lastDisplayUpdateMillis = 0;
 const unsigned long DISPLAY_UPDATE_INTERVAL_MS = 200;
 
-// SD hotplug detection control
 unsigned long lastSDCheckMillis = 0;
 const unsigned long SD_CHECK_INTERVAL_MS = 2000;
 
-// File created message control
 bool showFileCreatedMsg = false;
 unsigned long fileCreatedMsgStart = 0;
-const unsigned long FILE_CREATED_MSG_DURATION_MS = 3000; // 3 seconds
+const unsigned long FILE_CREATED_MSG_DURATION_MS = 3000;
 
-// GPS & date/time helpers
+// ==================== GPS & TIME HELPERS ====================
 struct LocalTime { int hour; int minute; int second; };
-unsigned long loggingStartMillis = 0; // <-- fixed declaration
 
-// ==================== RPM ISR ====================
-void IRAM_ATTR hallISR() { pulseCount++; }
-
-// Convert GPS time + longitude to local time
 LocalTime getLocalTime(TinyGPSDate date, TinyGPSTime time, double longitude) {
   int timezoneOffsetHours = -5;
   int month = date.month();
   int day = date.day();
-  int hour = time.hour();
   if (month>3 && month<11) timezoneOffsetHours = -5;
   else if (month==3 && day>=8) timezoneOffsetHours = -4;
   else if (month==11 && day<=7) timezoneOffsetHours = -4;
+
   int h = time.hour() + timezoneOffsetHours;
   int m = time.minute();
   int s = time.second();
-  
-  if (s >= 60) { s -= 60; m += 1; }
-  if (s < 0)   { s += 60; m -= 1; }
-  if (m >= 60) { m -= 60; h += 1; }
-  if (m < 0)   { m += 60; h -= 1; }
-  if (h >= 24) h -= 24;
-  if (h < 0)   { h += 24; }
-  
-  return LocalTime{h, m, s};
+
+  if (s>=60){ s-=60; m+=1;} if(s<0){s+=60;m-=1;}
+  if(m>=60){ m-=60; h+=1;} if(m<0){ m+=60; h-=1;}
+  if(h>=24) h-=24; if(h<0) h+=24;
+
+  return LocalTime{h,m,s};
 }
 
-void format12Hour(int hour24, int &hour12, const char* &amPm) {
-  if (hour24 == 0) { hour12 = 12; amPm = "AM"; }
-  else if (hour24 < 12) { hour12 = hour24; amPm = "AM"; }
-  else if (hour24 == 12) { hour12 = 12; amPm = "PM"; }
-  else { hour12 = hour24 - 12; amPm = "PM"; }
+void format12Hour(int hour24,int &hour12,const char* &amPm) {
+  if(hour24==0){hour12=12;amPm="AM";}
+  else if(hour24<12){hour12=hour24;amPm="AM";}
+  else if(hour24==12){hour12=12;amPm="PM";}
+  else{hour12=hour24-12;amPm="PM";}
 }
 
-// ==================== FILENAME (8.3 safe) ====================
+// ==================== FILE NAME ====================
 void generateNextAvailableLogFileName(char *outFilename, size_t outSize, int yy, int mm, int dd) {
-  for (int i = 0; i < 100; ++i) {
-    snprintf(outFilename, outSize, "/L%02d%02d%02d%02d.CSV", yy, mm, dd, i);
-    if (!SD.exists(outFilename)) return;
+  for(int i=0;i<100;++i){
+    snprintf(outFilename,outSize,"/L%02d%02d%02d%02d.CSV",yy,mm,dd,i);
+    if(!SD.exists(outFilename)) return;
   }
-  snprintf(outFilename, outSize, "/L%02d%02d%02d99.CSV", yy, mm, dd);
+  snprintf(outFilename,outSize,"/L%02d%02d%02d99.CSV",yy,mm,dd);
 }
 
 bool openLogFileNew() {
-  if (!sdInserted) return false;
-  int yy = gps.date.isValid() ? gps.date.year() % 100 : 0;
+  if(!sdInserted) return false;
+  int yy = gps.date.isValid() ? gps.date.year()%100 : 0;
   int mm = gps.date.isValid() ? gps.date.month() : 0;
   int dd = gps.date.isValid() ? gps.date.day() : 0;
-
   char fn[20];
-  generateNextAvailableLogFileName(fn, sizeof(fn), yy, mm, dd);
+  generateNextAvailableLogFileName(fn,sizeof(fn),yy,mm,dd);
   currentLogFileName = String(fn);
-
   logFile = SD.open(currentLogFileName.c_str(), FILE_WRITE);
-  if (!logFile) return false;
+  if(!logFile){ Serial.print("Failed: ");Serial.println(currentLogFileName); return false; }
+  Serial.print("New log file: "); Serial.println(currentLogFileName);
   logFile.println("lat,lon,speed_mph,UTC_datetime,RPM");
   logFile.flush();
   return true;
 }
 
 bool openLogFileIfNeeded() {
-  if (!sdInserted) return false;
-  if (logFile) return true;
-  if (currentLogFileName.length() > 0) {
+  if(!sdInserted) return false;
+  if(logFile) return true;
+  if(currentLogFileName.length()>0){
     logFile = SD.open(currentLogFileName.c_str(), FILE_WRITE);
-    if (logFile) return true;
+    if(logFile) return true;
   }
   return false;
 }
 
-// ==================== LOG BUFFERING & FLUSH ====================
+// ==================== LOG BUFFER ====================
 void flushLogBuffer() {
-  if (logLinesCount == 0) return;
-
-  if (!sdInserted) { bottomMessage = "No SD card!"; bottomMessageTimestamp = millis(); return; }
-  if (!openLogFileIfNeeded()) { bottomMessage = "SD File Error"; bottomMessageTimestamp = millis(); return; }
-
-  size_t bytesToWrite = logLinesCount * LOG_LINE_SIZE;
+  if(logLinesCount==0) return;
+  if(!sdInserted){ bottomMessage="No SD card!"; bottomMessageTimestamp=millis(); return; }
+  if(!openLogFileIfNeeded()){ bottomMessage="SD File Error"; bottomMessageTimestamp=millis(); return; }
+  size_t bytesToWrite = logLinesCount*LOG_LINE_SIZE;
   size_t wrote = logFile.write((const uint8_t*)logBuffer, bytesToWrite);
-
-  if (wrote != bytesToWrite) {
-    if (logFile) logFile.close();
-    if (openLogFileIfNeeded()) logFile.write((const uint8_t*)logBuffer, bytesToWrite);
-    else { isLogging = false; bottomMessage = "SD Write Error"; bottomMessageTimestamp = millis(); }
-  } else {
+  if(wrote!=bytesToWrite){
+    if(logFile) logFile.close();
+    if(openLogFileIfNeeded()) logFile.write((const uint8_t*)logBuffer, bytesToWrite);
+    else{ isLogging=false; bottomMessage="SD Write Error"; bottomMessageTimestamp=millis(); }
+  } else{
     logFile.flush();
-    logLinesCount = 0;
-    bottomMessage = "Writing...";
-    bottomMessageTimestamp = millis();
+    logLinesCount=0;
+    bottomMessage="Writing...";
+    bottomMessageTimestamp=millis();
   }
 }
 
 void bufferLogLine() {
   char line[LOG_LINE_SIZE];
-  int speed_mph = gps.speed.isValid() ? (int)(gps.speed.mph() + 0.5) : -1;
-  int len = snprintf(line, sizeof(line),
-    "%.6f,%.6f,%d,%04d-%02d-%02d %02d:%02d:%02d,%d\n",
-    gps.location.isValid() ? gps.location.lat() : 0.0,
-    gps.location.isValid() ? gps.location.lng() : 0.0,
+  int speed_mph = gps.speed.isValid() ? (int)(gps.speed.mph()+0.5) : -1;
+  int len = snprintf(line,sizeof(line),
+    "%.6f,%.6f,%d,%04d-%02d-%02d %02d:%02d:%02d,%lu\n",
+    gps.location.isValid()?gps.location.lat():0.0,
+    gps.location.isValid()?gps.location.lng():0.0,
     speed_mph,
-    gps.date.isValid() ? gps.date.year() : 0,
-    gps.date.isValid() ? gps.date.month() : 0,
-    gps.date.isValid() ? gps.date.day() : 0,
-    gps.time.isValid() ? gps.time.hour() : 0,
-    gps.time.isValid() ? gps.time.minute() : 0,
-    gps.time.isValid() ? gps.time.second() : 0,
-    RPM
+    gps.date.isValid()?gps.date.year():0,
+    gps.date.isValid()?gps.date.month():0,
+    gps.date.isValid()?gps.date.day():0,
+    gps.time.isValid()?gps.time.hour():0,
+    gps.time.isValid()?gps.time.minute():0,
+    gps.time.isValid()?gps.time.second():0,
+    rpm
   );
-
-  if (len < 0) return;
-  if ((size_t)len > LOG_LINE_SIZE) { len = LOG_LINE_SIZE; line[LOG_LINE_SIZE-1] = '\n'; }
-  for (int i=len;i<(int)LOG_LINE_SIZE;++i) line[i]=' ';
-
-  if (logLinesCount >= LOG_LINES_MAX) flushLogBuffer();
-  if (logLinesCount < LOG_LINES_MAX) {
-    memcpy(&logBuffer[logLinesCount*LOG_LINE_SIZE], line, LOG_LINE_SIZE);
+  if(len<0) return;
+  if((size_t)len>LOG_LINE_SIZE){ len=LOG_LINE_SIZE; line[LOG_LINE_SIZE-1]='\n'; }
+  for(int i=len;i<(int)LOG_LINE_SIZE;++i) line[i]=' ';
+  if(logLinesCount>=LOG_LINES_MAX) flushLogBuffer();
+  if(logLinesCount<LOG_LINES_MAX){
+    memcpy(&logBuffer[logLinesCount*LOG_LINE_SIZE],line,LOG_LINE_SIZE);
     logLinesCount++;
   }
 }
 
-// ==================== DISPLAY FUNCTIONS ====================
+// ==================== DISPLAY ====================
 void updateDisplayLogging() {
   unsigned long now = millis();
-
-  if (showFileCreatedMsg) {
+  if(showFileCreatedMsg){
     display.clearDisplay();
-    display.setCursor(0,0);
-    display.setTextSize(1);
+    display.setCursor(0,0); display.setTextSize(1);
     display.print("File created:");
-    display.setCursor(0,12);
-    display.print(currentLogFileName);
+    display.setCursor(0,12); display.print(currentLogFileName);
     display.display();
-    if (now - fileCreatedMsgStart >= FILE_CREATED_MSG_DURATION_MS) showFileCreatedMsg=false;
+    if(now-fileCreatedMsgStart>=FILE_CREATED_MSG_DURATION_MS) showFileCreatedMsg=false;
     return;
   }
 
-  if (now - lastBlinkTime > 500) { blinkState = !blinkState; lastBlinkTime=now; }
-
+  if(now-lastBlinkTime>500){ blinkState=!blinkState; lastBlinkTime=now; }
   display.clearDisplay();
   display.setCursor(0,0);
 
-  if (gps.time.isValid() && gps.date.isValid()) {
-    LocalTime lt = getLocalTime(gps.date, gps.time, gps.location.isValid() ? gps.location.lng() : 0.0);
+  if(gps.time.isValid() && gps.date.isValid()){
+    LocalTime lt=getLocalTime(gps.date,gps.time,gps.location.isValid()?gps.location.lng():0.0);
     int h12; const char* ampm;
     format12Hour(lt.hour,h12,ampm);
     display.printf("%02d:%02d:%02d %s\n",h12,lt.minute,lt.second,ampm);
   } else display.println("--:--:--");
 
   bool hasFixLocal = gps.location.isValid() && gps.location.age()<3000;
-  display.printf("Fix: %s\n", hasFixLocal ? "YES" : "NO");
-
-  if (gps.satellites.isValid()) display.printf("Sats: %d\n", gps.satellites.value());
+  display.printf("Fix: %s\n",hasFixLocal?"YES":"NO");
+  if(gps.satellites.isValid()) display.printf("Sats: %d\n",gps.satellites.value());
   else display.println("Sats: --");
 
-  // MPH (large)
-  display.setTextSize(3);
-  display.setCursor(0, 24);
-  if (gps.speed.isValid()) display.printf("MPH:%3d", (int)(gps.speed.mph() + 0.5));
+  display.setTextSize(3); display.setCursor(0,24);
+  if(gps.speed.isValid()) display.printf("MPH:%3d",(int)(gps.speed.mph()+0.5));
   else display.println("MPH: --");
 
-  // RPM (only show if rpmSeen is true)
-  if (rpmSeen) {
-    display.setCursor(0, 52);
-    display.printf("RPM:%4d", RPM);
-  }
+  if(rpm>0){ display.setTextSize(2); display.setCursor(0,52); display.printf("RPM:%4lu",rpm); }
 
   display.setTextSize(1);
-
-  // Icons
-  if (sdInserted) {
-    if (isLogging && blinkState && gps.location.isValid())
+  if(sdInserted){
+    if(isLogging && blinkState && gps.location.isValid())
       display.drawBitmap(83,0,dot16x16,16,16,SH110X_WHITE);
     display.drawBitmap(112,0,sdIcon16x16,16,16,SH110X_WHITE);
   }
-
-  if (bottomMessage.length()>0 && millis()-bottomMessageTimestamp<BOTTOM_MESSAGE_DURATION_MS) {
-    display.setCursor(0,100);
-    display.print(bottomMessage);
+  if(bottomMessage.length()>0 && millis()-bottomMessageTimestamp<BOTTOM_MESSAGE_DURATION_MS){
+    display.setCursor(0,100); display.print(bottomMessage);
   }
-
   display.display();
 }
 
 // ==================== BUTTON HANDLING ====================
-void handleButton() {
-  bool reading = digitalRead(BUTTON_PIN);
+void handleButton(){
+  bool reading=digitalRead(BUTTON_PIN);
   unsigned long now=millis();
-  if (reading!=lastButtonReading) buttonLastChange=now;
-  if ((now-buttonLastChange)>BUTTON_DEBOUNCE_DELAY) {
-    if (reading!=buttonStableState) {
+  if(reading!=lastButtonReading) buttonLastChange=now;
+  if((now-buttonLastChange)>BUTTON_DEBOUNCE_DELAY){
+    if(reading!=buttonStableState){
       buttonStableState=reading;
-      if (buttonStableState==LOW) buttonPressStart=now;
-      else {
+      if(buttonStableState==LOW) buttonPressStart=now;
+      else{
         unsigned long pressLen=now-buttonPressStart;
-        if (pressLen>=BUTTON_LONG_PRESS_TIME) { buttonLongPressed=true; buttonJustClicked=false; }
-        else { buttonJustClicked=true; buttonLongPressed=false; }
+        if(pressLen>=BUTTON_LONG_PRESS_TIME){ buttonLongPressed=true; buttonJustClicked=false; }
+        else{ buttonJustClicked=true; buttonLongPressed=false; }
       }
     }
   }
   lastButtonReading=reading;
 }
 
-bool hasFix() { return gps.location.isValid() && gps.location.age()<3000 && gps.satellites.isValid() && gps.satellites.value()>=3; }
+bool hasFix(){ return gps.location.isValid() && gps.location.age()<3000 && gps.satellites.isValid() && gps.satellites.value()>=3; }
 
-void checkSDCardPresence() {
+// ==================== SD CARD ====================
+void checkSDCardPresence(){
   unsigned long now=millis();
-  if (now-lastSDCheckMillis<SD_CHECK_INTERVAL_MS) return;
+  if(now-lastSDCheckMillis<SD_CHECK_INTERVAL_MS) return;
   lastSDCheckMillis=now;
-  bool currentlyInserted = SD.begin(SD_CS);
-  if (currentlyInserted && !sdInserted) {
-    sdInserted=true;
-    bottomMessage="SD Inserted"; bottomMessageTimestamp=now;
-  } else if (!currentlyInserted && sdInserted) {
-    sdInserted=false;
-    bottomMessage="SD Removed"; bottomMessageTimestamp=now;
-    if (isLogging) { if (logLinesCount>0) flushLogBuffer(); if (logFile) logFile.close(); isLogging=false; }
+  bool currentlyInserted=SD.begin(SD_CS);
+  if(currentlyInserted && !sdInserted){ sdInserted=true; bottomMessage="SD Inserted"; bottomMessageTimestamp=now; }
+  else if(!currentlyInserted && sdInserted){
+    sdInserted=false; bottomMessage="SD Removed"; bottomMessageTimestamp=now;
+    if(isLogging){ if(logLinesCount>0) flushLogBuffer(); if(logFile) logFile.close(); isLogging=false; }
   }
 }
 
 // ==================== SETUP ====================
-void setup() {
+void setup(){
   Serial.begin(115200);
   randomSeed(analogRead(0));
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_PIN,INPUT_PULLUP);
 
-  // Hall sensor interrupt
-  pinMode(HALL_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(HALL_PIN), hallISR, FALLING);
-  lastRPMSampleMillis = millis();
+  pinMode(HALL_PIN,INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN), onPulse, FALLING);
 
   Wire.begin(SDA_PIN,SCL_PIN);
   display.begin(0x3C,true);
-  display.setRotation(0);
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SH110X_WHITE);
-  display.setCursor(0,0);
-  display.println("Initializing...");
-  display.display();
+  display.setRotation(0); display.clearDisplay(); display.setTextSize(1); display.setTextColor(SH110X_WHITE);
+  display.setCursor(0,0); display.println("Initializing..."); display.display();
 
   gpsSerial.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   SPI.begin(SD_CLK,SD_MISO,SD_MOSI,SD_CS);
-  if (SD.begin(SD_CS)) { sdInserted=true; bottomMessage="SD Ready"; bottomMessageTimestamp=millis(); }
-  else { sdInserted=false; bottomMessage="No SD card!"; bottomMessageTimestamp=millis(); display.clearDisplay(); display.setCursor(0,0); display.println("No SD card!"); display.display(); }
+  if(SD.begin(SD_CS)){ sdInserted=true; bottomMessage="SD Ready"; bottomMessageTimestamp=millis(); }
+  else{ sdInserted=false; bottomMessage="No SD card!"; bottomMessageTimestamp=millis(); display.clearDisplay(); display.setCursor(0,0); display.println("No SD card!"); display.display(); }
+
   lastBufferFlushMillis=millis();
   isLogging=false;
   bottomMessage=""; bottomMessageTimestamp=0;
@@ -370,76 +358,48 @@ void setup() {
 }
 
 // ==================== MAIN LOOP ====================
-void loop() {
+void loop(){
   handleButton();
   checkSDCardPresence();
+  updateRpm();
 
   unsigned long now=millis();
 
-  // ==== RPM update at 10 Hz (ones digit forced to 0) ====
-  const unsigned long rpmInterval = 1000UL / RPM_UPDATE_HZ;
-  if (now - lastRPMSampleMillis >= rpmInterval) {
-    unsigned long elapsed = now - lastRPMSampleMillis;
-    lastRPMSampleMillis = now;
-
-    noInterrupts();
-    unsigned long pulses = pulseCount;
-    pulseCount = 0;
-    interrupts();
-
-    if (pulses > 0) rpmSeen = true;
-
-    float rpmRaw = (elapsed > 0) ? ((float)pulses / PULSES_PER_REV) * (60000.0f / (float)elapsed) : 0.0f;
-    int rpmInt = (int)rpmRaw;
-    RPM = (rpmInt / 10) * 10; // force ones digit to 0
-  }
-
-  if (buttonJustClicked) {
-    if ((now-lastToggleMillis)>=TOGGLE_COOLDOWN_MS) {
-      if (!sdInserted) { bottomMessage="No SD card!"; bottomMessageTimestamp=now; }
-      else {
-        if (!isLogging) {
-          if (openLogFileNew()) {
-            logFile.flush();
-            isLogging=true;
-            lastLoggedSecond=-1;
-            lastBufferFlushMillis=now;
-            loggingStartMillis=now;
-            lastToggleMillis=now;
-            showFileCreatedMsg=true;
-            fileCreatedMsgStart=now;
+  if(buttonJustClicked){
+    if((now-lastToggleMillis)>=TOGGLE_COOLDOWN_MS){
+      if(!sdInserted){ bottomMessage="No SD card!"; bottomMessageTimestamp=now; }
+      else{
+        if(!isLogging){
+          if(openLogFileNew()){
+            logFile.flush(); isLogging=true; lastLoggedSecond=-1; lastBufferFlushMillis=now;
+            loggingStartMillis=now; lastToggleMillis=now; showFileCreatedMsg=true; fileCreatedMsgStart=now;
             bottomMessage=""; bottomMessageTimestamp=0;
-          } else { bottomMessage="File error!"; bottomMessageTimestamp=now; }
-        } else {
-          if (logLinesCount>0) flushLogBuffer();
-          if (logFile) logFile.close();
-          isLogging=false;
-          lastToggleMillis=now;
-          bottomMessage="Saved as: "+currentLogFileName;
-          bottomMessageTimestamp=now;
+          } else{ bottomMessage="File error!"; bottomMessageTimestamp=now; }
+        } else{
+          if(logLinesCount>0) flushLogBuffer();
+          if(logFile) logFile.close(); isLogging=false; lastToggleMillis=now;
+          bottomMessage="Saved as: "+currentLogFileName; bottomMessageTimestamp=now;
         }
       }
     }
     buttonJustClicked=false;
   }
 
-  if (buttonLongPressed) { bottomMessage="Long press"; bottomMessageTimestamp=now; buttonLongPressed=false; }
+  if(buttonLongPressed){ bottomMessage="Long press"; bottomMessageTimestamp=now; buttonLongPressed=false; }
 
-  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+  while(gpsSerial.available()) gps.encode(gpsSerial.read());
 
-  if (isLogging && gps.time.isValid() && gps.date.isValid() && hasFix() && sdInserted) {
+  if(isLogging && gps.time.isValid() && gps.date.isValid() && hasFix() && sdInserted){
     int currentSecond=gps.time.second();
-    if (currentSecond!=lastLoggedSecond) { lastLoggedSecond=currentSecond; bufferLogLine(); }
+    if(currentSecond!=lastLoggedSecond){ lastLoggedSecond=currentSecond; bufferLogLine(); }
   }
 
-  if (millis()-lastBufferFlushMillis>=BUFFER_FLUSH_INTERVAL_MS) {
-    if (logLinesCount>0 && sdInserted && isLogging) {
-      if (openLogFileIfNeeded()) flushLogBuffer();
-    }
+  if(millis()-lastBufferFlushMillis>=BUFFER_FLUSH_INTERVAL_MS){
+    if(logLinesCount>0 && sdInserted && isLogging){ if(openLogFileIfNeeded()) flushLogBuffer(); }
     lastBufferFlushMillis=millis();
   }
 
-  if (now-lastDisplayUpdateMillis>DISPLAY_UPDATE_INTERVAL_MS) {
+  if(now-lastDisplayUpdateMillis>DISPLAY_UPDATE_INTERVAL_MS){
     updateDisplayLogging();
     lastDisplayUpdateMillis=now;
   }
