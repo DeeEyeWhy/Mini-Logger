@@ -67,7 +67,7 @@ def create_map(df):
     ).add_to(m)
 
     # Add legend for speed with smooth gradient matching map
-    num_samples = 16
+    num_samples = 32
     colors = [mcolors.to_hex(cmap(x)) for x in [i/(num_samples-1) for i in range(num_samples)]]
     colormap = LinearColormap(
         colors=colors,
