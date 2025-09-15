@@ -67,7 +67,7 @@ def create_map(df):
     ).add_to(m)
 
     # Add legend for speed with smooth gradient matching map
-    num_samples = 11
+    num_samples = 16
     colors = [mcolors.to_hex(cmap(x)) for x in [i/(num_samples-1) for i in range(num_samples)]]
     colormap = LinearColormap(
         colors=colors,
@@ -139,14 +139,14 @@ if uploaded_file:
         ).miles
 
     # Summary stats
-    st.markdown("### Summary Statistics")
+    st.markdown("### Summary Statistics:")
     st.markdown(f"- **Top Speed:** {top_speed:.1f} mph")
     st.markdown(f"- **Average Speed:** {avg_speed:.1f} mph")
     st.markdown(f"- **Total Time:** {total_time_str}")
     st.markdown(f"- **Total Distance:** {total_distance_miles:.2f} miles")
 
     # Show interactive map
-    st.subheader("Interactive GPS Map")
+    st.subheader("Interactive Map")
     folium_map = create_map(df)
     st_folium(folium_map, width=700, height=500)
 
