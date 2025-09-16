@@ -9,7 +9,7 @@ import datetime
 from geopy.distance import geodesic
 from branca.colormap import LinearColormap
 
-st.title("Mini Logger V4.1 CSV Map Converter")
+st.title("Mini Logger CSV Map Converter")
 
 uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
 
