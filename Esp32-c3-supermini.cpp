@@ -253,49 +253,97 @@ void bufferLogLine() {
 
 // ==================== DISPLAY ====================
 void updateDisplayLogging() {
-  unsigned long now = millis();
-  if(showFileCreatedMsg){
+    unsigned long now = millis();
+
+    // Show "File Created" message if active
+    if (showFileCreatedMsg) {
+        display.clearDisplay();
+        display.setCursor(0,0); display.setTextSize(1);
+        display.print("File created:");
+        display.setCursor(0,12); display.print(currentLogFileName);
+        display.display();
+        if (now - fileCreatedMsgStart >= FILE_CREATED_MSG_DURATION_MS) showFileCreatedMsg = false;
+        return;
+    }
+
+    // Blink state for logging indicator
+    static bool blinkState = false;
+    static unsigned long lastBlinkTime = 0;
+    if (now - lastBlinkTime > 500) { blinkState = !blinkState; lastBlinkTime = now; }
+
+    // Clear display
     display.clearDisplay();
-    display.setCursor(0,0); display.setTextSize(1);
-    display.print("File created:");
-    display.setCursor(0,12); display.print(currentLogFileName);
+    display.setCursor(0,0);
+
+    // Display local time
+    if (gps.time.isValid() && gps.date.isValid()) {
+        LocalTime lt = getLocalTime(gps.date, gps.time, gps.location.isValid()?gps.location.lng():0.0);
+        int h12; const char* ampm;
+        format12Hour(lt.hour, h12, ampm);
+        display.printf("%02d:%02d:%02d %s\n", h12, lt.minute, lt.second, ampm);
+    } else display.println("--:--:--");
+
+    // GPS fix and satellites
+    bool hasFixLocal = gps.location.isValid() && gps.location.age()<3000;
+    display.printf("Fix: %s\n", hasFixLocal ? "YES" : "NO");
+    if (gps.satellites.isValid()) display.printf("Sats: %d\n", gps.satellites.value());
+    else display.println("Sats: --");
+
+    // Speed display
+    display.setTextSize(3); display.setCursor(0,24);
+    if (gps.speed.isValid()) display.printf("MPH:%3d", (int)(gps.speed.mph() + 0.5));
+    else display.println("MPH: --");
+
+    // ==================== RPM DISPLAY (15–30 Hz, filtered) ====================
+    static float displayRpm = 0;
+    static unsigned long lastDisplayRpmUpdate = 0;
+    const unsigned long DISPLAY_RPM_INTERVAL_MS = 33; // ~30 Hz
+    const float MAX_RPM_JUMP_PER_MS = 10.0;           // 1000 RPM / 100 ms
+
+    if (now - lastDisplayRpmUpdate >= DISPLAY_RPM_INTERVAL_MS) {
+        lastDisplayRpmUpdate = now;
+
+        static unsigned long lastPulseTimeCopy = 0;
+        noInterrupts();
+        unsigned long pulseTime = lastPulseTime;
+        interrupts();
+
+        float targetRpm = 0;
+        unsigned long interval = pulseTime - lastPulseTimeCopy;
+        if (interval > 0 && interval < 2000) { // 2 pulses per rev
+            targetRpm = 60000.0f / (interval * 2.0f);
+            lastPulseTimeCopy = pulseTime;
+        }
+
+        // Limit jump
+        float maxJump = MAX_RPM_JUMP_PER_MS * DISPLAY_RPM_INTERVAL_MS;
+        float diff = targetRpm - displayRpm;
+        if (diff > maxJump) diff = maxJump;
+        else if (diff < -maxJump) diff = -maxJump;
+        displayRpm += diff;
+
+        // Reset if no pulse for 2 sec
+        if (millis() - pulseTime > 2000) displayRpm = 0;
+    }
+
+    if ((int)(displayRpm + 0.5f) > 0) {
+        display.setTextSize(2); display.setCursor(0,52);
+        display.printf("RPM:%4d", (int)(displayRpm + 0.5f));
+    }
+
+    // ==================== SD / Logging Indicators ====================
+    display.setTextSize(1);
+    if (sdInserted) {
+        if (isLogging && blinkState && gps.location.isValid())
+            display.drawBitmap(83,0,dot16x16,16,16,SH110X_WHITE);
+        display.drawBitmap(112,0,sdIcon16x16,16,16,SH110X_WHITE);
+    }
+
+    if (bottomMessage.length() > 0 && millis() - bottomMessageTimestamp < BOTTOM_MESSAGE_DURATION_MS) {
+        display.setCursor(0,100); display.print(bottomMessage);
+    }
+
     display.display();
-    if(now-fileCreatedMsgStart>=FILE_CREATED_MSG_DURATION_MS) showFileCreatedMsg=false;
-    return;
-  }
-
-  if(now-lastBlinkTime>500){ blinkState=!blinkState; lastBlinkTime=now; }
-  display.clearDisplay();
-  display.setCursor(0,0);
-
-  if(gps.time.isValid() && gps.date.isValid()){
-    LocalTime lt=getLocalTime(gps.date,gps.time,gps.location.isValid()?gps.location.lng():0.0);
-    int h12; const char* ampm;
-    format12Hour(lt.hour,h12,ampm);
-    display.printf("%02d:%02d:%02d %s\n",h12,lt.minute,lt.second,ampm);
-  } else display.println("--:--:--");
-
-  bool hasFixLocal = gps.location.isValid() && gps.location.age()<3000;
-  display.printf("Fix: %s\n",hasFixLocal?"YES":"NO");
-  if(gps.satellites.isValid()) display.printf("Sats: %d\n",gps.satellites.value());
-  else display.println("Sats: --");
-
-  display.setTextSize(3); display.setCursor(0,24);
-  if(gps.speed.isValid()) display.printf("MPH:%3d",(int)(gps.speed.mph()+0.5));
-  else display.println("MPH: --");
-
-  if(rpm>0){ display.setTextSize(2); display.setCursor(0,52); display.printf("RPM:%4lu",rpm); }
-
-  display.setTextSize(1);
-  if(sdInserted){
-    if(isLogging && blinkState && gps.location.isValid())
-      display.drawBitmap(83,0,dot16x16,16,16,SH110X_WHITE);
-    display.drawBitmap(112,0,sdIcon16x16,16,16,SH110X_WHITE);
-  }
-  if(bottomMessage.length()>0 && millis()-bottomMessageTimestamp<BOTTOM_MESSAGE_DURATION_MS){
-    display.setCursor(0,100); display.print(bottomMessage);
-  }
-  display.display();
 }
 
 // ==================== BUTTON HANDLING ====================
