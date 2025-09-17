@@ -48,7 +48,8 @@ const unsigned long BUFFER_FLUSH_INTERVAL_MS = (unsigned long)FLUSH_INTERVAL_SEC
 
 // ==================== RPM DISPLAY CONFIG ====================
 // Adjustable display refresh interval for RPM (ms)
-unsigned long RPM_DISPLAY_INTERVAL_MS = 33; // ~30 Hz
+// Change at runtime if you want; default 33ms (~30Hz)
+unsigned long RPM_DISPLAY_INTERVAL_MS = 33; // Adjustable: 33ms ≈ 30Hz, 66ms ≈ 15Hz
 const float MAX_RPM_JUMP_PER_MS = 10.0;     // 1000 RPM max change per 100 ms
 
 // Display & GPS objects
@@ -70,7 +71,9 @@ const unsigned char dot16x16[] PROGMEM = {
 // ==================== STATE ====================
 bool sdInserted = false;
 bool isLogging = false;
-unsigned long lastLoggedSecond = -1;
+
+// changed to int to match gps.time.second() range and comparisons
+int lastLoggedSecond = -1;
 
 char logBuffer[LOG_LINE_SIZE * LOG_LINES_MAX];
 size_t logLinesCount = 0;
@@ -78,6 +81,9 @@ size_t logLinesCount = 0;
 String currentLogFileName = "";
 File logFile;
 unsigned long lastBufferFlushMillis = 0;
+
+// ADDED: loggingStartMillis was missing — declared here to fix compile error.
+unsigned long loggingStartMillis = 0;
 
 // ==================== RPM (Safe ISR) ====================
 volatile unsigned long lastPulseTime = 0;
@@ -275,7 +281,7 @@ void updateDisplayLogging() {
     // GPS fix and satellites
     bool hasFixLocal = gps.location.isValid() && gps.location.age()<3000;
     display.printf("Fix: %s\n", hasFixLocal ? "YES" : "NO");
-    if (gps.satellites.isValid()) display.printf("Sats: %d\n", gps.satellites.value());
+    if (gps.satellites.isValid()) display.printf("Sats: %d\n",gps.satellites.value());
     else display.println("Sats: --");
 
     // Speed display
@@ -302,8 +308,8 @@ void updateDisplayLogging() {
             lastPulseTimeCopy = pulseTime;
         }
 
-        // Limit jump
-        float maxJump = MAX_RPM_JUMP_PER_MS * RPM_DISPLAY_INTERVAL_MS;
+        // Limit jump based on configured per-ms maximum
+        float maxJump = MAX_RPM_JUMP_PER_MS * (float)RPM_DISPLAY_INTERVAL_MS;
         float diff = targetRpm - displayRpm;
         if (diff > maxJump) diff = maxJump;
         else if (diff < -maxJump) diff = -maxJump;
@@ -312,7 +318,7 @@ void updateDisplayLogging() {
         // Reset if no pulse for 2 sec
         if (millis() - pulseTime > 2000) displayRpm = 0;
 
-        // --- accumulate for logging ---
+        // --- accumulate for logging average ---
         rpmAccumulator += displayRpm;
         rpmSamples++;
     }
@@ -409,13 +415,21 @@ void loop(){
       else{
         if(!isLogging){
           if(openLogFileNew()){
-            logFile.flush(); isLogging=true; lastLoggedSecond=-1; lastBufferFlushMillis=now;
-            loggingStartMillis=now; lastToggleMillis=now; showFileCreatedMsg=true; fileCreatedMsgStart=now;
+            logFile.flush();
+            isLogging=true;
+            lastLoggedSecond=-1;
+            lastBufferFlushMillis=now;
+            loggingStartMillis=now;              // uses the added variable
+            lastToggleMillis=now;
+            showFileCreatedMsg=true;
+            fileCreatedMsgStart=now;
             bottomMessage=""; bottomMessageTimestamp=0;
           } else{ bottomMessage="File error!"; bottomMessageTimestamp=now; }
         } else{
           if(logLinesCount>0) flushLogBuffer();
-          if(logFile) logFile.close(); isLogging=false; lastToggleMillis=now;
+          if(logFile) logFile.close();
+          isLogging=false;
+          lastToggleMillis=now;
           bottomMessage="Saved as: "+currentLogFileName; bottomMessageTimestamp=now;
         }
       }
@@ -427,10 +441,13 @@ void loop(){
 
   while(gpsSerial.available()) gps.encode(gpsSerial.read());
 
-  // Logging (once per second)
+  // Logging (once per second, uses averaged RPM accumulated in display updates)
   if(isLogging && gps.time.isValid() && gps.date.isValid() && hasFix() && sdInserted){
     int currentSecond=gps.time.second();
-    if(currentSecond!=lastLoggedSecond){ lastLoggedSecond=currentSecond; bufferLogLine(); }
+    if(currentSecond!=lastLoggedSecond){
+      lastLoggedSecond=currentSecond;
+      bufferLogLine();
+    }
   }
 
   if(millis()-lastBufferFlushMillis>=BUFFER_FLUSH_INTERVAL_MS){
