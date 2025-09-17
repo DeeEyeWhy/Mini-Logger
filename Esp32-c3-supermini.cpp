@@ -1,19 +1,16 @@
 /*
-  Mini Logger - Full Sketch (Safe RPM ISR)
+  Mini Logger - Full Sketch (Safe RPM ISR + Display & Logging RPM)
   - 8.3-safe filenames: /LYYMMDDxx.CSV
   - SD hotplug detection
   - Debounced button (short click toggles logging)
   - Buffered logging flushed every FLUSH_INTERVAL_SECONDS
   - OLED shows local time based on GPS longitude
 
-  + Safe WiFi tachometer–style RPM:
+  + Tachometer-style RPM:
     - Hall-effect RPM on IO1 (HALL_PIN 1)
     - ISR only sets timestamp & flag
-    - RPM computed in main loop
-    - lastPulseTime tracked safely
-    - rpm reset to 0 if no pulse for 2000 ms
-    - Same rpm used for OLED + CSV
-    - RPM text drawn only when rpm > 0
+    - Display RPM filtered & updated at adjustable refresh rate
+    - Logging uses average RPM from display over LOG_INTERVAL_SECONDS
 */
 
 #include <Wire.h>
@@ -49,6 +46,11 @@
 #define LOG_LINES_MAX ((FLUSH_INTERVAL_SECONDS) / (LOG_INTERVAL_SECONDS))
 const unsigned long BUFFER_FLUSH_INTERVAL_MS = (unsigned long)FLUSH_INTERVAL_SECONDS * 1000UL;
 
+// ==================== RPM DISPLAY CONFIG ====================
+// Adjustable display refresh interval for RPM (ms)
+unsigned long RPM_DISPLAY_INTERVAL_MS = 33; // ~30 Hz
+const float MAX_RPM_JUMP_PER_MS = 10.0;     // 1000 RPM max change per 100 ms
+
 // Display & GPS objects
 Adafruit_SH1107 display(128, 128, &Wire);
 TinyGPSPlus gps;
@@ -68,9 +70,7 @@ const unsigned char dot16x16[] PROGMEM = {
 // ==================== STATE ====================
 bool sdInserted = false;
 bool isLogging = false;
-unsigned long lastBlinkTime = 0;
-bool blinkState = false;
-int lastLoggedSecond = -1;
+unsigned long lastLoggedSecond = -1;
 
 char logBuffer[LOG_LINE_SIZE * LOG_LINES_MAX];
 size_t logLinesCount = 0;
@@ -79,42 +79,24 @@ String currentLogFileName = "";
 File logFile;
 unsigned long lastBufferFlushMillis = 0;
 
-unsigned long loggingStartMillis = 0;
-
 // ==================== RPM (Safe ISR) ====================
 volatile unsigned long lastPulseTime = 0;
 volatile bool pulseDetected = false;
 
-unsigned long rpm = 0;
-unsigned long lastRpmCalcTime = 0;
+// Filtered display RPM
+float displayRpm = 0;
 
+// RPM averaging for logging
+float rpmAccumulator = 0;
+int rpmSamples = 0;
+
+// ISR for Hall sensor
 void IRAM_ATTR onPulse() {
   unsigned long now = millis();
   if (now - lastPulseTime > 10) {  // 10ms debounce
     lastPulseTime = now;
     pulseDetected = true;           // just set flag
   }
-}
-
-void updateRpm() {
-  unsigned long now = millis();
-  static unsigned long lastPulseTimeCopy = 0;
-
-  // safely copy volatile variables
-  noInterrupts();
-  unsigned long pulseTime = lastPulseTime;
-  bool detected = pulseDetected;
-  pulseDetected = false;
-  interrupts();
-
-  if (detected) {
-    unsigned long interval = pulseTime - lastPulseTimeCopy;
-    if (interval > 0) rpm = 60000 / interval / 2; // 2 pulses per rev
-    lastPulseTimeCopy = pulseTime;
-    lastRpmCalcTime = now;
-  }
-
-  if (now - lastRpmCalcTime > 2000) rpm = 0; // reset if no pulse for 2 sec
 }
 
 // ==================== BUTTON ====================
@@ -225,9 +207,16 @@ void flushLogBuffer() {
   }
 }
 
+// ==================== LOG LINE ====================
 void bufferLogLine() {
   char line[LOG_LINE_SIZE];
   int speed_mph = gps.speed.isValid() ? (int)(gps.speed.mph()+0.5) : -1;
+
+  // --- Use averaged RPM for logging ---
+  unsigned long avgRpm = (rpmSamples>0) ? (unsigned long)(rpmAccumulator / rpmSamples + 0.5f) : 0;
+  rpmAccumulator = 0;
+  rpmSamples = 0;
+
   int len = snprintf(line,sizeof(line),
     "%.6f,%.6f,%d,%04d-%02d-%02d %02d:%02d:%02d,%lu\n",
     gps.location.isValid()?gps.location.lat():0.0,
@@ -239,7 +228,7 @@ void bufferLogLine() {
     gps.time.isValid()?gps.time.hour():0,
     gps.time.isValid()?gps.time.minute():0,
     gps.time.isValid()?gps.time.second():0,
-    rpm
+    avgRpm
   );
   if(len<0) return;
   if((size_t)len>LOG_LINE_SIZE){ len=LOG_LINE_SIZE; line[LOG_LINE_SIZE-1]='\n'; }
@@ -294,16 +283,14 @@ void updateDisplayLogging() {
     if (gps.speed.isValid()) display.printf("MPH:%3d", (int)(gps.speed.mph() + 0.5));
     else display.println("MPH: --");
 
-    // ==================== RPM DISPLAY (15–30 Hz, filtered) ====================
-    static float displayRpm = 0;
+    // ==================== RPM DISPLAY (adjustable refresh, filtered) ====================
     static unsigned long lastDisplayRpmUpdate = 0;
-    const unsigned long DISPLAY_RPM_INTERVAL_MS = 33; // ~30 Hz
-    const float MAX_RPM_JUMP_PER_MS = 10.0;           // 1000 RPM / 100 ms
+    static unsigned long lastPulseTimeCopy = 0;
 
-    if (now - lastDisplayRpmUpdate >= DISPLAY_RPM_INTERVAL_MS) {
+    if (now - lastDisplayRpmUpdate >= RPM_DISPLAY_INTERVAL_MS) {
         lastDisplayRpmUpdate = now;
 
-        static unsigned long lastPulseTimeCopy = 0;
+        // Copy volatile safely
         noInterrupts();
         unsigned long pulseTime = lastPulseTime;
         interrupts();
@@ -316,7 +303,7 @@ void updateDisplayLogging() {
         }
 
         // Limit jump
-        float maxJump = MAX_RPM_JUMP_PER_MS * DISPLAY_RPM_INTERVAL_MS;
+        float maxJump = MAX_RPM_JUMP_PER_MS * RPM_DISPLAY_INTERVAL_MS;
         float diff = targetRpm - displayRpm;
         if (diff > maxJump) diff = maxJump;
         else if (diff < -maxJump) diff = -maxJump;
@@ -324,6 +311,10 @@ void updateDisplayLogging() {
 
         // Reset if no pulse for 2 sec
         if (millis() - pulseTime > 2000) displayRpm = 0;
+
+        // --- accumulate for logging ---
+        rpmAccumulator += displayRpm;
+        rpmSamples++;
     }
 
     if ((int)(displayRpm + 0.5f) > 0) {
@@ -436,6 +427,7 @@ void loop(){
 
   while(gpsSerial.available()) gps.encode(gpsSerial.read());
 
+  // Logging (once per second)
   if(isLogging && gps.time.isValid() && gps.date.isValid() && hasFix() && sdInserted){
     int currentSecond=gps.time.second();
     if(currentSecond!=lastLoggedSecond){ lastLoggedSecond=currentSecond; bufferLogLine(); }
