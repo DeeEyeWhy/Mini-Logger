@@ -409,7 +409,6 @@ void setup(){
 void loop(){
   handleButton();
   checkSDCardPresence();
-  updateRpm();
 
   unsigned long now=millis();
 
